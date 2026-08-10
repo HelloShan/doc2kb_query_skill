@@ -1,0 +1,36 @@
+# doc2kb — 依赖清单
+# 按层级分组，可按需安装
+
+# ============================================================
+# 【核心层】所有模式都需要
+# ============================================================
+fastembed~=0.6         # CPU本地嵌入向量生成
+lancedb~=0.18          # 嵌入式向量数据库
+tantivy>=0.22          # LanceDB 全文检索(FTS)依赖的底层引擎
+                        # 缺失时 create_fts_index / hybrid 检索会直接 ImportError（实测确认）
+pyarrow>=15.0          # LanceDB 底层数据格式
+numpy>=1.24            # ingest.py 直接 import，此前只靠 pyarrow/lancedb 间接带入
+python-dotenv>=1.0     # 加载 .env 配置文件（config.py / query_reference/server.py 都用到）
+langchain-text-splitters>=0.3  # Markdown 结构感知分块
+tqdm>=4.66             # 进度条
+
+# ============================================================
+# 【转换层】文档转换模式需要
+# ============================================================
+python-docx>=1.1       # .docx → MD 转换
+python-pptx>=1.0       # .pptx → MD 转换
+pypdf>=5.0             # .pdf → MD 轻量转换（纯Python）
+openpyxl>=3.1          # .xlsx → MD 转换（Excel → Markdown表格）
+xlrd>=2.0              # .xls  → MD 转换（旧版Excel）
+olefile>=0.47          # .doc  → MD 回退提取（纯Python，无格式）
+#pywin32>=306           # .doc → .docx 转换（Windows 调用 Office/WPS COM）
+
+# ============================================================
+# 【可选层】按需安装
+# ============================================================
+# docling>=2.0          # PDF 高质量转换（含OCR、布局分析，依赖较重）
+#                      # 安装: uv pip install docling
+# pytesseract>=0.3      # OCR 回退引擎（需额外安装 tesseract-ocr 系统包）
+# Pillow>=10.0          # 图片处理（OCR 时依赖）
+PyYAML>=6.0             # 术语表(glossary.yaml)解析用；不装的话术语展开功能
+                        # 静默降级为无操作，不影响其它流程
