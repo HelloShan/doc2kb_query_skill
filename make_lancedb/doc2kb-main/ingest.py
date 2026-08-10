@@ -456,9 +456,13 @@ def chunk_markdown_file(md_path: Path) -> List[dict]:
 
 def _delete_old_chunks(table, source_rel_path: str):
     """从 LanceDB 中删除指定源文件的所有旧分块（线程安全）。"""
+    # 路径中如果含双引号（Linux 下合法文件名字符），不转义会拼出错误的
+    # 过滤表达式，轻则删除失败，重则匹配到不该匹配的行——SQL 过滤字符串
+    # 拼接必须转义引号。
+    escaped = source_rel_path.replace('"', '""')
     with _lancedb_lock:
         try:
-            table.delete(f'source = "{source_rel_path}"')
+            table.delete(f'source = "{escaped}"')
         except Exception:
             pass  # 表可能是空的，忽略
 

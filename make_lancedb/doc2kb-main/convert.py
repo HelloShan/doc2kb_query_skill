@@ -168,56 +168,26 @@ def scan_compatibility(directory: Path) -> list[tuple[Path, str]]:
     return problems
 
 
-# Docling 子进程 Worker 路径
-_WORKER_PATH = Path(__file__).parent / "docling_worker.py"
-
-
 def _convert_with_docling(source_path: Path, output_path: Path
                           ) -> Tuple[str, Optional[str], Optional[str]]:
     """
-    用 Docling 转换文档（支持 docx/pdf），隔离在子进程中。
-    Docling 的 C 扩展在遇到损坏文件时可能 segfault，
-    子进程模式确保主进程不会因此崩溃。
+    用 Docling 转换文档（支持 docx/pdf）。
+
+    注：不再在这里单独起子进程隔离 Docling 调用。上层的
+    `convert_single_file_isolated()` 已经把"整个单文件转换"（包括这里的
+    Docling 调用、失败后的原生降级路径等）打包放进一个独立子进程里跑，
+    并配有真正的操作系统级超时+崩溃隔离；如果这里再单独起一层子进程，
+    只会让每个 docx/pdf 文件多付一次 Python 解释器启动 + Docling 模型
+    加载的开销，没有任何额外收益。
     返回 (status, error, warning)。
     """
-    import subprocess
-    import tempfile
-    import json
-
-    rf = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
-    rf.close()
-    result_file = rf.name
-
     try:
-        result = subprocess.run(
-            [sys.executable, str(_WORKER_PATH),
-             str(source_path), str(output_path), result_file],
-            capture_output=True,
-            timeout=CONVERT_TIMEOUT,
-        )
+        converter = _get_docling_converter()
+        result = converter.convert(str(source_path))
+        md_content = result.document.export_to_markdown()
+    except Exception as e:
+        return ("error", f"Docling: {type(e).__name__}: {e}", None)
 
-        if result.returncode != 0:
-            if result.returncode < 0:
-                return ("error", f"Docling 子进程被信号 {-result.returncode} 杀死（段错误）", None)
-            return ("error", f"Docling 子进程异常退出 (exitcode={result.returncode})", None)
-
-        # exitcode == 0：读取结果
-        with open(result_file) as f:
-            result_data = json.load(f)
-
-        if result_data.get("status") == "error":
-            return ("error", f"Docling: {result_data['error']}", None)
-
-    except subprocess.TimeoutExpired:
-        return ("error", "Docling 子进程超时（>600s），已强制终止", None)
-    finally:
-        try:
-            os.unlink(result_file)
-        except OSError:
-            pass
-
-    # 子进程转换成功，读取输出文件进行后处理
-    md_content = output_path.read_text(encoding="utf-8")
     if not md_content.strip():
         return ("empty", "Docling 转换内容为空", None)
 
@@ -225,6 +195,7 @@ def _convert_with_docling(source_path: Path, output_path: Path
     if not md_content.strip():
         return ("empty", "内容为空（移除了所有模板段落）", None)
 
+    _ensure_output_dir(output_path)
     output_path.write_text(md_content, encoding="utf-8")
     warning = _check_md_size(output_path)
 
@@ -550,35 +521,55 @@ def _docx_fallback(source_path: Path, output_path: Path
         return ("error", e_str)
 
 
-def _docx_to_md(doc, source_path: Path, output_path: Path) -> Tuple[str, Optional[str]]:
-    md_lines = []
-    for para in doc.paragraphs:
-        text = para.text.strip()
-        if not text:
-            continue
-        style_name = para.style.name.lower() if para.style else ""
-        if "heading 1" in style_name or "title" in style_name:
-            md_lines.append(f"# {text}")
-        elif "heading 2" in style_name:
-            md_lines.append(f"## {text}")
-        elif "heading 3" in style_name:
-            md_lines.append(f"### {text}")
-        elif "heading" in style_name:
-            level = 4
-            for s in ("heading 4", "heading 5", "heading 6"):
-                if s in style_name:
-                    level = int(s[-1])
-                    break
-            md_lines.append(f"{'#' * level} {text}")
-        else:
-            md_lines.append(text)
+def _para_to_md_line(para) -> Optional[str]:
+    text = para.text.strip()
+    if not text:
+        return None
+    style_name = para.style.name.lower() if para.style else ""
+    if "heading 1" in style_name or "title" in style_name:
+        return f"# {text}"
+    if "heading 2" in style_name:
+        return f"## {text}"
+    if "heading 3" in style_name:
+        return f"### {text}"
+    if "heading" in style_name:
+        level = 4
+        for s in ("heading 4", "heading 5", "heading 6"):
+            if s in style_name:
+                level = int(s[-1])
+                break
+        return f"{'#' * level} {text}"
+    return text
 
-    for table in doc.tables:
-        md_lines.append("")
-        for row in table.rows:
-            cells = [cell.text.strip().replace("\n", " ") for cell in row.cells]
-            md_lines.append("| " + " | ".join(cells) + " |")
-        md_lines.append("")
+
+def _table_to_md_lines(table) -> List[str]:
+    lines = [""]
+    for row in table.rows:
+        cells = [cell.text.strip().replace("\n", " ") for cell in row.cells]
+        lines.append("| " + " | ".join(cells) + " |")
+    lines.append("")
+    return lines
+
+
+def _docx_to_md(doc, source_path: Path, output_path: Path) -> Tuple[str, Optional[str]]:
+    # 按文档原始顺序遍历正文元素（段落/表格交错出现），而不是先把所有
+    # 段落收集完再统一把所有表格追加到末尾——后者会把"表格前后各有一段
+    # 说明文字"的排版完全打乱，表格永远漂到文档最后，语义关联丢失。
+    # python-docx 没有直接给出"正文元素按序遍历"的 API，但 Paragraph 和
+    # Table 对象都能拿到各自的底层 XML 元素（`_p` / `_tbl`），可以反查
+    # 它在 body 里的原始位置。
+    body = doc.element.body
+    para_by_elem = {p._p: p for p in doc.paragraphs}
+    table_by_elem = {t._tbl: t for t in doc.tables}
+
+    md_lines = []
+    for child in body.iterchildren():
+        if child in para_by_elem:
+            line = _para_to_md_line(para_by_elem[child])
+            if line is not None:
+                md_lines.append(line)
+        elif child in table_by_elem:
+            md_lines.extend(_table_to_md_lines(table_by_elem[child]))
 
     md_content = "\n\n".join(md_lines).strip()
     if not md_content:
@@ -976,39 +967,130 @@ def convert_single_file(source_path: Path) -> dict:
     return result
 
 
+# 通用单文件转换子进程 Worker 路径
+_CONVERT_WORKER_PATH = Path(__file__).parent / "convert_worker.py"
+
+
+def convert_single_file_isolated(source_path: Path, timeout: int = CONVERT_TIMEOUT) -> dict:
+    """
+    在独立子进程里转换单个文件——这是真正的操作系统级超时 + 崩溃隔离。
+
+    相比直接在 ThreadPoolExecutor 的线程里调用 convert_single_file()：
+      - 超时保护是真的：子进程超时后会被 subprocess.run(timeout=...)
+        用 SIGKILL 强制杀掉，对应的线程池 worker 线程能立刻返回、空出来
+        去处理下一个排队的文件。不会再出现"某个文件在原生解析库里卡死，
+        线程无法从外部打断，线程池被逐渐耗尽，as_completed() 因为没有
+        任何 future 完成而无限期阻塞、界面停止刷新、Ctrl+C 后重跑仍卡在
+        同一个文件"的情况（这正是本函数要修复的问题——旧版把超时判断
+        写在 as_completed() 之后，只有 future 真正完成时才检查得到，
+        对于卡死在线程里、永远不会完成的任务完全不起作用）。
+      - 崩溃隔离：任何原生扩展（Docling / python-docx / openpyxl / ...）
+        如果段错误，只有这一个子进程死掉，主流水线不受影响。
+
+    代价：每个文件多一次 Python 解释器启动开销（通常 <1s）。docx/pdf 走
+    Docling 时模型仍按文件重新加载——这是历史行为，不是本次改动引入的
+    新开销（另见 README 的性能优化建议一节）。
+    """
+    import subprocess
+    import tempfile
+    import json as _json
+
+    rel_path = _get_rel_path(source_path)
+
+    rf = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+    rf.close()
+    result_file = rf.name
+
+    result = {
+        "rel_path": rel_path,
+        "status": "error",
+        "md_path": None,
+        "error": None,
+        "warning": None,
+        "sha256": "",
+        "size": 0,
+        "mtime": "",
+    }
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(_CONVERT_WORKER_PATH), str(source_path), result_file],
+            capture_output=True,
+            timeout=timeout,
+        )
+        if proc.returncode < 0:
+            result["error"] = f"转换子进程被信号 {-proc.returncode} 杀死（可能段错误）"
+            return result
+        if proc.returncode != 0:
+            stderr_tail = proc.stderr.decode("utf-8", "ignore")[-800:] if proc.stderr else ""
+            result["error"] = f"转换子进程异常退出 (exitcode={proc.returncode}) {stderr_tail}".strip()
+            return result
+
+        with open(result_file, encoding="utf-8") as f:
+            loaded = _json.load(f)
+        # 子进程正常返回但内部捕获了异常（比如 convert.py import 失败）时，
+        # loaded 里可能只有 status/error，缺少 rel_path 等字段，这里补全。
+        result.update(loaded)
+        result.setdefault("rel_path", rel_path)
+        return result
+
+    except subprocess.TimeoutExpired:
+        result["error"] = f"转换超时（>{timeout}s），已强制终止子进程并跳过该文件"
+        return result
+    except Exception as e:
+        result["error"] = f"调用转换子进程失败: {type(e).__name__}: {e}"
+        return result
+    finally:
+        try:
+            os.unlink(result_file)
+        except OSError:
+            pass
+
+
 def convert_batch(file_paths: List[Path],
                   max_workers: int = CONVERT_WORKERS,
                   timeout: int = CONVERT_TIMEOUT,
-                  progress_callback=None) -> List[dict]:
+                  progress_callback=None,
+                  start_callback=None) -> List[dict]:
     """
-    批量转换文件，支持 Ctrl+C 中断和单文件超时。
+    批量转换文件，支持 Ctrl+C 中断和单文件超时（真实生效，见
+    convert_single_file_isolated 的说明）。
 
-    注意（已知限制）：Docling 转换在独立子进程中运行，子进程超时会被
-    subprocess.run(timeout=...) 真正杀掉；但原生降级解析器
-    （python-docx/pypdf/openpyxl/python-pptx）和 .md/.txt 路径运行在线程里，
-    ThreadPoolExecutor 无法真正打断一个已在运行的线程，future.cancel()
-    对它们不起作用。超时后这里只是不再等待该线程的结果、不写入 state，
-    该线程仍可能在后台把 .md 写完——下一次增量 build 会基于源文件 SHA256
-    重新判断是否需要处理，不会因此丢失数据，但短时间内可能有一次多余的重复转换。
+    Parameters
+    ----------
+    start_callback : callable, optional
+        每个文件被提交执行前调用一次（参数：相对路径），用于实时打印
+        "正在处理 xxx"，便于在文件真的很慢/卡住时第一时间定位是哪个文件，
+        而不是要等到超时或整批结束才知道。
     """
     results = []
-    stuck_files = []
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(convert_single_file, fp): fp for fp in file_paths}
+        futures = {}
+        for fp in file_paths:
+            if start_callback:
+                try:
+                    rel = fp.relative_to(SOURCE_DIR).as_posix()
+                except ValueError:
+                    rel = str(fp)
+                start_callback(rel)
+            futures[pool.submit(convert_single_file_isolated, fp, timeout)] = fp
+
         try:
             for future in as_completed(futures):
                 fp = futures[future]
                 try:
-                    result = future.result(timeout=timeout)
+                    # 子进程内部已经用 subprocess.run(timeout=...) 强制
+                    # 保证不会超过 `timeout` 秒，这里的 timeout 只是双重
+                    # 保险（给子进程自身的收尾/清理留一点缓冲时间）。
+                    result = future.result(timeout=timeout + 30)
                 except TimeoutError:
                     rel = fp.relative_to(SOURCE_DIR).as_posix() if hasattr(fp, 'relative_to') else str(fp)
-                    stuck_files.append(rel)
                     result = {
                         "rel_path": rel,
                         "status": "error",
                         "md_path": None,
-                        "error": f"转换超时（>{timeout}s），已跳过（线程可能仍在运行）",
+                        "error": f"转换超时（>{timeout + 30}s），已跳过",
                         "warning": None,
                         "sha256": "",
                         "size": 0,

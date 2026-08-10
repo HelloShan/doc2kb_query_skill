@@ -380,6 +380,7 @@ def run_build(args, log: Logger):
             files_to_convert,
             max_workers=CONVERT_WORKERS,
             progress_callback=lambda r: _on_convert_done(r, state, stats, log),
+            start_callback=lambda rel: log.info(f"  ▶ 开始处理 {rel}"),
         )
 
         elapsed = time.time() - t0
@@ -757,7 +758,8 @@ def run_delete(args, log: Logger):
     # ── 构造删除条件 ──
     conditions = []
     if args.source:
-        conditions.append(f'source = "{args.source}"')
+        source_escaped = args.source.replace('"', '""')
+        conditions.append(f'source = "{source_escaped}"')
     if args.prefix:
         prefix_escaped = args.prefix.replace('"', '""')
         conditions.append(f'source LIKE "{prefix_escaped}%"')
