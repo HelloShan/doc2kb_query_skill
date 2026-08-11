@@ -61,8 +61,9 @@ curl -X POST http://127.0.0.1:8788/ \
 ## 常驻 Server 机制
 
 **模型只加载一次。** 第一次调用 `query.py` 时，脚本检测到没有常驻进程，
-会自动在后台拉起一个（冷启动约 5-10 秒，取决于模型大小），之后所有查询
-都通过 HTTP 发给这个进程处理，响应毫秒级。空闲超过 `IDLE_TIMEOUT`（默认 1 小时）
+会自动在后台拉起一个（冷启动约 5-10 秒，取决于模型大小；首次运行如果
+本地还没有模型缓存，需要额外的下载时间），之后所有查询都通过 HTTP
+发给这个进程处理，响应毫秒级。空闲超过 `IDLE_TIMEOUT`（默认 1 小时）
 后自动退出，下次调用再重新拉起。
 
 ```
@@ -70,14 +71,29 @@ curl -X POST http://127.0.0.1:8788/ \
 后续调用   ──→ 检测到 server 已在跑 ──────────────────────────────→ 转发查询 ──→ 返回结果
 ```
 
+**同一台机器上部署多个知识库怎么办？** 这个 skill 经常被分发给不同的人
+/ 用在不同的知识库上，大家的 `.env` 大多是照抄 `.env.example`，默认端口
+都是 `8788`。脚本会在拉起/复用 server 前，先用 `/health` 校验对方服务的
+知识库路径是否和自己配置的一致；如果端口已经被**另一个知识库**的 server
+占用，会自动在 `[PORT, PORT+DOC2KB_QUERY_PORT_SCAN_RANGE)` 范围内找一个
+空闲端口拉起自己的 server，不需要每次都手动改端口，也不会出现"误查到
+别人知识库内容"的情况。实际使用的端口可能和 `.env` 里配置的不一样——
+可以通过 `.server_<端口>.pid` 文件反查，或者直接看 `/health` 返回的
+`db_path` 确认命中的是不是自己的知识库。
+
 重启 server（修改配置后）：
 ```bash
+# 先确认自己知识库实际用的是哪个端口（文件名里带端口号）
+ls scripts/.server_*.pid
 # Linux
-kill $(cat scripts/.server.pid)
+kill $(cat scripts/.server_<端口>.pid)
 # Windows
-taskkill /PID <scripts/.server.pid 里的值> /F
+taskkill /PID <scripts/.server_<端口>.pid 里的值> /F
 # 之后直接再发一次查询，会自动重新拉起
 ```
+
+如果自动拉起失败（比如缺依赖、端口范围内确实没有空位），报错信息里会
+附上 `scripts/.server_<端口>.startup.log` 的末尾内容，通常能直接看出原因。
 
 ## 返回格式
 
@@ -133,10 +149,16 @@ taskkill /PID <scripts/.server.pid 里的值> /F
 | `DOC2KB_QUERY_TOP_K` | `5` | 返回结果数 |
 | `DOC2KB_QUERY_SIMILARITY_THRESHOLD` | `0.5` | 余弦相似度过滤阈值 |
 | `DOC2KB_QUERY_HOST` | `127.0.0.1` | server 监听地址 |
-| `DOC2KB_QUERY_PORT` | `8788` | server 端口 |
+| `DOC2KB_QUERY_PORT` | `8788` | server 端口（若被其它知识库占用，会在扫描范围内自动换一个，见下） |
+| `DOC2KB_QUERY_PORT_SCAN_RANGE` | `10` | 端口自动避让的扫描范围，即 `[PORT, PORT+此值)` |
+| `DOC2KB_QUERY_SERVER_START_TIMEOUT` | `60` | 等待常驻 server 就绪的超时（秒），首次运行需下载模型时可调大 |
 | `DOC2KB_QUERY_IDLE_TIMEOUT` | `3600` | 空闲自动退出（秒）|
 | `DOC2KB_QUERY_AUTH_TOKEN` | （空）| 访问口令，空=不鉴权 |
 | `DOC2KB_QUERY_GLOSSARY_PATH` | `../glossary.yaml` | 术语表，不存在时跳过 |
+
+> `DOC2KB_QUERY_DB_PATH` / `DOC2KB_QUERY_GLOSSARY_PATH` 配成相对路径时，
+> 会按"相对这个脚本所在目录"解析，不依赖你从哪个目录运行命令，可以放心
+> 让 Claude/自动化脚本从任意工作目录调用。
 
 ## 常见问题
 

@@ -19,6 +19,7 @@ doc2kb — 文档转换引擎模块
 import os
 import re
 import sys
+import threading
 import traceback
 from pathlib import Path
 from typing import Optional, Tuple, List
@@ -27,7 +28,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from config import (
     SOURCE_DIR, OUTPUT_MD_DIR, SUPPORTED_EXTENSIONS, CODE_CONFIG_EXTENSIONS,
     SOURCE_EXT_MARKER_PREFIX,
-    CONVERT_WORKERS, MAX_MD_FILE_SIZE_KB, CONVERT_TIMEOUT,
+    CONVERT_WORKERS, MAX_MD_FILE_SIZE_KB, CONVERT_TIMEOUT, DOCLING_MAX_CONCURRENT,
 )
 from validate import is_file_readable
 from state import compute_sha256
@@ -60,6 +61,12 @@ def _ensure_output_dir(output_path: Path):
 
 _DOCLING_CONVERTER = None
 _DOCLING_SUPPORTED = {".docx", ".pdf"}
+
+# Docling 单独的并发闸门，独立于 CONVERT_WORKERS（见 config.py 里
+# DOCLING_MAX_CONCURRENT 的详细说明）。docx/pdf 转换在拿到这个信号量之前
+# 会排队等待，不会真正去起那个会加载一整套模型的子进程；xlsx/pptx/txt
+# 等原生解析路径完全不受影响，仍按 CONVERT_WORKERS 的并发数正常跑。
+_docling_semaphore = threading.Semaphore(max(1, DOCLING_MAX_CONCURRENT))
 
 
 def _get_docling_converter():
@@ -971,7 +978,8 @@ def convert_single_file(source_path: Path) -> dict:
 _CONVERT_WORKER_PATH = Path(__file__).parent / "convert_worker.py"
 
 
-def convert_single_file_isolated(source_path: Path, timeout: int = CONVERT_TIMEOUT) -> dict:
+def convert_single_file_isolated(source_path: Path, timeout: int = CONVERT_TIMEOUT,
+                                 start_callback=None) -> dict:
     """
     在独立子进程里转换单个文件——这是真正的操作系统级超时 + 崩溃隔离。
 
@@ -990,12 +998,25 @@ def convert_single_file_isolated(source_path: Path, timeout: int = CONVERT_TIMEO
     代价：每个文件多一次 Python 解释器启动开销（通常 <1s）。docx/pdf 走
     Docling 时模型仍按文件重新加载——这是历史行为，不是本次改动引入的
     新开销（另见 README 的性能优化建议一节）。
+
+    start_callback 在这里（真正开始跑这个文件的 worker 线程里）调用，
+    而不是在提交任务的那一刻调用——线程池只有 max_workers 个并发名额，
+    如果在"提交"时就打印"开始处理"，会把还在排队、根本没轮到执行的文件
+    也一起打出来，跟实际进度完全对不上（之前的版本就是这个问题：384 个
+    文件的"开始处理"几乎在同一秒内全部打印完，之后线程池才真正开始跑，
+    看起来像是"全部同时卡住"，其实只是日志时机不对）。
     """
     import subprocess
     import tempfile
     import json as _json
 
     rel_path = _get_rel_path(source_path)
+
+    if start_callback:
+        try:
+            start_callback(rel_path)
+        except Exception:
+            pass  # 日志/回调本身出问题，不能让它连累转换任务
 
     rf = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
     rf.close()
@@ -1012,6 +1033,12 @@ def convert_single_file_isolated(source_path: Path, timeout: int = CONVERT_TIMEO
         "mtime": "",
     }
 
+    # 只有 docx/pdf 会真正走 Docling（拖内存的那部分）；xlsx/pptx/txt 等
+    # 原生解析格式完全不需要排队等这个信号量，仍按 CONVERT_WORKERS 的
+    # 并发数直接跑，不受影响。
+    needs_docling_slot = source_path.suffix.lower() in _DOCLING_SUPPORTED
+    if needs_docling_slot:
+        _docling_semaphore.acquire()
     try:
         proc = subprocess.run(
             [sys.executable, str(_CONVERT_WORKER_PATH), str(source_path), result_file],
@@ -1023,7 +1050,16 @@ def convert_single_file_isolated(source_path: Path, timeout: int = CONVERT_TIMEO
             return result
         if proc.returncode != 0:
             stderr_tail = proc.stderr.decode("utf-8", "ignore")[-800:] if proc.stderr else ""
-            result["error"] = f"转换子进程异常退出 (exitcode={proc.returncode}) {stderr_tail}".strip()
+            # Windows 下常见的原生崩溃 exitcode（不会像 POSIX 那样变成负数），
+            # 直接提示出来，比一串 exitcode 数字更容易看懂是什么问题。
+            _WIN_CRASH_CODES = {
+                3221225477: "0xC0000005 访问违规（常见于内存不足/耗尽时原生扩展崩溃）",
+                3221225620: "0xC0000094 整数除零",
+                3221225725: "0xC00000FD 栈溢出",
+            }
+            hint = _WIN_CRASH_CODES.get(proc.returncode)
+            hint_str = f"，疑似 {hint}" if hint else ""
+            result["error"] = f"转换子进程异常退出 (exitcode={proc.returncode}){hint_str} {stderr_tail}".strip()
             return result
 
         with open(result_file, encoding="utf-8") as f:
@@ -1045,6 +1081,8 @@ def convert_single_file_isolated(source_path: Path, timeout: int = CONVERT_TIMEO
             os.unlink(result_file)
         except OSError:
             pass
+        if needs_docling_slot:
+            _docling_semaphore.release()
 
 
 def convert_batch(file_paths: List[Path],
@@ -1059,22 +1097,18 @@ def convert_batch(file_paths: List[Path],
     Parameters
     ----------
     start_callback : callable, optional
-        每个文件被提交执行前调用一次（参数：相对路径），用于实时打印
-        "正在处理 xxx"，便于在文件真的很慢/卡住时第一时间定位是哪个文件，
-        而不是要等到超时或整批结束才知道。
+        每个文件真正开始在 worker 里执行时调用一次（参数：相对路径），
+        用于实时打印"正在处理 xxx"，便于在文件真的很慢/卡住时第一时间
+        定位是哪个文件——注意这是"真正开始跑"才触发，不是"提交进队列"
+        就触发，避免和线程池的实际并发数对不上。
     """
     results = []
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {}
-        for fp in file_paths:
-            if start_callback:
-                try:
-                    rel = fp.relative_to(SOURCE_DIR).as_posix()
-                except ValueError:
-                    rel = str(fp)
-                start_callback(rel)
-            futures[pool.submit(convert_single_file_isolated, fp, timeout)] = fp
+        futures = {
+            pool.submit(convert_single_file_isolated, fp, timeout, start_callback): fp
+            for fp in file_paths
+        }
 
         try:
             for future in as_completed(futures):
@@ -1097,9 +1131,33 @@ def convert_batch(file_paths: List[Path],
                         "mtime": "",
                     }
                     future.cancel()
+                except Exception as e:
+                    # worker 内部出现了 convert_single_file_isolated 自身
+                    # 都没能捕获的异常（理论上不该发生，但防御性地兜住，
+                    # 避免单个文件的意外问题带崩整个 as_completed 循环，
+                    # 导致本该继续跑的其它文件也一起停摆）。
+                    rel = fp.relative_to(SOURCE_DIR).as_posix() if hasattr(fp, 'relative_to') else str(fp)
+                    result = {
+                        "rel_path": rel,
+                        "status": "error",
+                        "md_path": None,
+                        "error": f"worker 内部异常: {type(e).__name__}: {e}",
+                        "warning": None,
+                        "sha256": "",
+                        "size": 0,
+                        "mtime": "",
+                    }
                 results.append(result)
                 if progress_callback:
-                    progress_callback(result)
+                    try:
+                        progress_callback(result)
+                    except Exception as e:
+                        # 同样道理：打印/记录进度这一步本身出错（比如
+                        # Windows 控制台编码不支持某些字符），不能让它
+                        # 把整个转换流程带崩、连累后面还没处理的文件。
+                        print(f"[WARN] progress_callback 出错（已忽略，"
+                              f"不影响转换结果）: {type(e).__name__}: {e}",
+                              file=sys.stderr)
         except KeyboardInterrupt:
             for f in futures:
                 f.cancel()

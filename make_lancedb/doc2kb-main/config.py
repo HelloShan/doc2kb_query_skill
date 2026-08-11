@@ -60,6 +60,23 @@ def _env_float(name: str, default: float) -> float:
 # 这里强制覆盖掉。
 os.environ.setdefault("HF_ENDPOINT", os.getenv("DOC2KB_HF_ENDPOINT", "https://hf-mirror.com"))
 
+# 一旦本地已经有 Docling/HuggingFace 模型缓存，可以打开这个开关跳过所有
+# 联网检查。docx/pdf 每次起 Docling 转换时，huggingface_hub 都会尝试连一次
+# 网核实模型版本/缓存是否最新——如果这台机器访问 hf-mirror.com（或配置的
+# 官方源）不稳定甚至连不上（公司网络、代理、防火墙都可能导致这种情况，
+# 而且可能是间歇性的，之前几百个文件能成功不代表现在依然能连上），
+# 每一次这样的联网检查都可能顶着系统 TCP 超时（往往长达几十秒到几分钟）
+# 卡住——如果同一时刻有几个 worker 线程恰好都在处理 docx/pdf，会看起来
+# 像是"全部一起卡死"，跟真正的死循环卡死表现几乎一样，但根因完全不同
+# （一个是代码 bug，一个是网络问题），需要分开排查。
+# 打开这个开关后，Docling/huggingface_hub 完全依赖本地缓存，不再发起任何
+# 网络请求：网络好不好都不会等，缓存有就用，缓存没有就直接报错（不会卡住），
+# 适合"模型已经确认下载过、只是想安安静静把剩下的文件跑完"的场景。
+DOC2KB_HF_OFFLINE = _env_bool("DOC2KB_HF_OFFLINE", False)
+if DOC2KB_HF_OFFLINE:
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
 # ============================================================
 # 抑制第三方库的无效告警
 # ============================================================
@@ -167,6 +184,28 @@ GLOSSARY_PATH = Path(os.getenv("DOC2KB_GLOSSARY_PATH", "../glossary.yaml"))
 
 # 转换阶段的并行线程数
 CONVERT_WORKERS = _env_int("DOC2KB_CONVERT_WORKERS", 4)
+
+# Docling（docx/pdf 的高质量转换引擎）单独的并发上限，独立于 CONVERT_WORKERS。
+# ────────────────────────────────────────────────────────────────────
+# 重要：Docling 每次转换都会在自己的子进程里重新加载一整套模型（版面分析 +
+# TableFormer 表格识别，装了 OCR 的话还有 OCR 模型），单个实例常规也要
+# 占用 1GB+ 内存，处理大图片/复杂表格时峰值会更高。CONVERT_WORKERS 控制的
+# 是"总并发线程数"，但 xlsx/pptx/txt 这些走原生解析的文件很轻量，同时跑
+# 4 个完全没问题；docx/pdf 一旦同时凑够 CONVERT_WORKERS 个都在跑 Docling，
+# 相当于同时把好几份完整的模型塞进内存，很容易在处理大文件/复杂表格时
+# 直接把系统内存挤爆——实测会看到 `std::bad_alloc`、
+# `numpy.core._exceptions._ArrayMemoryError`、甚至进程被系统直接杀掉
+# （Windows 下是 exitcode 3221225477 / 0xC0000005 access violation），
+# 表现为整台电脑卡死、显示驱动因资源耗尽触发重置（黑屏闪烁）——这不是
+# "内存泄漏"（该释放的没释放），而是短时间内并发加载的模型实例太多，
+# 瞬时内存需求超过了系统能提供的量。
+#
+# 这个值默认给得很保守（1，即 docx/pdf 全部排队、一个一个走 Docling），
+# 用来保证"不管 CONVERT_WORKERS 开多大，都不会因为 Docling 并发而把机器
+# 打死"。如果你的机器内存充足（比如 32GB+）、处理的文档也不算特别大，
+# 可以把这个值调到 2 观察一下内存占用再决定要不要继续调大；xlsx/pptx/txt
+# 等原生解析路径不受这个限制，仍然按 CONVERT_WORKERS 的并发跑。
+DOCLING_MAX_CONCURRENT = _env_int("DOC2KB_DOCLING_MAX_CONCURRENT", 1)
 
 # 入库阶段的 batch 大小（每批处理的文本数）
 EMBED_BATCH_SIZE = _env_int("DOC2KB_EMBED_BATCH_SIZE", 32)
