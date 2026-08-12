@@ -2,7 +2,6 @@
 """
 doc2kb 知识库查询 —— 自包含 Skill 脚本
 ========================================
-整合了 query_reference/server.py 的全部逻辑：
   - 常驻 HTTP server（模型只加载一次）
   - 自动拉起（首次查询检测到没有 server 时在后台启动）
   - hybrid 检索（向量 + BM25 + RRF 融合）
@@ -44,7 +43,7 @@ from typing import Any
 # 配置：从本文件同目录下的 .env 读取，不依赖项目根目录
 # ============================================================
 
-_SKILL_DIR = Path(__file__).resolve().parent
+_SKILL_DIR = Path(__file__).resolve().parent.parent
 
 try:
     from dotenv import load_dotenv
@@ -77,73 +76,67 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _resolve_path(raw: str) -> Path:
-    """
-    把 .env 里配置的路径解析成绝对路径。
-
-    这个 skill 会被分发到很多不同的地方使用，实际调用方式往往不是"cd 到
-    scripts 目录再手动跑"，而是被 Claude/自动化脚本从任意工作目录调用
-    （比如 Claude Code 的当前工作目录，或者某个上层编排脚本的 cwd）。
-
-    Path("../doc2kb.lancedb") 这种相对路径默认是相对"进程当前工作目录"
-    解析的，不是相对这个脚本文件所在目录——一旦调用方的 cwd 跟"手动在
-    scripts/ 目录里敲命令"时不一样，路径就会静默指向错误的位置（轻则
-    报"知识库路径不存在"，重则如果那个错误位置刚好也有个同名文件/目录，
-    会用错知识库都不会报错）。.env.example 里虽然写了"强烈建议用绝对
-    路径"，但这只是文档提醒，不能保证每个使用者都会照做，这里做兜底：
-    只要配置的是相对路径，一律按"相对这个脚本所在目录"解析，不再依赖
-    调用者的 cwd。
-    """
     p = Path(raw)
     return p if p.is_absolute() else (_SKILL_DIR / p)
 
 
-# 知识库身份参数（必须和构建端保持一致）
-DB_PATH      = _resolve_path(os.environ.get("DOC2KB_QUERY_DB_PATH",        "../doc2kb.lancedb"))
-TABLE_NAME   = os.environ.get("DOC2KB_QUERY_TABLE_NAME",           "docs")
-EMBEDDING_MODEL    = os.environ.get("DOC2KB_QUERY_EMBEDDING_MODEL",     "BAAI/bge-small-zh-v1.5")
-EMBEDDING_MAX_TOKENS = _env_int("DOC2KB_QUERY_EMBEDDING_MAX_TOKENS", 512)
-GLOSSARY_PATH = _resolve_path(os.environ.get("DOC2KB_QUERY_GLOSSARY_PATH",  "../glossary.yaml"))
+# ============================================================
+# 必填知识库身份参数（移除默认值，为空时直接提示并退出）
+# ============================================================
+_raw_db_path      = os.environ.get("DOC2KB_QUERY_DB_PATH", "").strip()
+_raw_table_name   = os.environ.get("DOC2KB_QUERY_TABLE_NAME", "").strip()
+_raw_model        = os.environ.get("DOC2KB_QUERY_EMBEDDING_MODEL", "").strip()
+_raw_max_tokens   = os.environ.get("DOC2KB_QUERY_EMBEDDING_MAX_TOKENS", "").strip()
+_raw_glossary     = os.environ.get("DOC2KB_QUERY_GLOSSARY_PATH", "").strip()
 
-# 检索参数
+_missing_configs = []
+if not _raw_db_path:     _missing_configs.append("DOC2KB_QUERY_DB_PATH")
+if not _raw_table_name:  _missing_configs.append("DOC2KB_QUERY_TABLE_NAME")
+if not _raw_model:       _missing_configs.append("DOC2KB_QUERY_EMBEDDING_MODEL")
+if not _raw_max_tokens:  _missing_configs.append("DOC2KB_QUERY_EMBEDDING_MAX_TOKENS")
+if not _raw_glossary:    _missing_configs.append("DOC2KB_QUERY_GLOSSARY_PATH")
+
+if _missing_configs:
+    print("=====================================================", file=sys.stderr)
+    print("[错误] 程序启动失败！检测到以下必要配置为空，请检查环境变量或 .env 设置：", file=sys.stderr)
+    for m in _missing_configs:
+        print(f" -> 缺少配置: {m}", file=sys.stderr)
+    print("=====================================================", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    EMBEDDING_MAX_TOKENS = int(_raw_max_tokens)
+except ValueError:
+    print(f"[错误] DOC2KB_QUERY_EMBEDDING_MAX_TOKENS 必须是整数格式，当前值: {_raw_max_tokens}", file=sys.stderr)
+    sys.exit(1)
+
+DB_PATH       = _resolve_path(_raw_db_path)
+TABLE_NAME    = _raw_table_name
+EMBEDDING_MODEL = _raw_model
+GLOSSARY_PATH = _resolve_path(_raw_glossary)
+
+
+# ============================================================
+# 可选/其它检索参数与服务监听配置
+# ============================================================
 TOP_K               = _env_int("DOC2KB_QUERY_TOP_K",              5)
 SIMILARITY_THRESHOLD = _env_float("DOC2KB_QUERY_SIMILARITY_THRESHOLD", 0.5)
 
-# 服务监听
 HOST         = os.environ.get("DOC2KB_QUERY_HOST",                 "127.0.0.1")
 PORT         = _env_int("DOC2KB_QUERY_PORT",                       8788)
-# 同一台机器上如果部署了多个知识库（分发给多人/多个项目各自使用时很常见），
-# 大家的 .env 大概率都是从同一份 .env.example 抄的，默认端口都是 8788，
-# 直接撞车。见下方 _find_or_start_server() 的说明：本脚本会在
-# [PORT, PORT+PORT_SCAN_RANGE) 范围内自动探测/避让，不需要每个人手动
-# 改端口，但仍然建议在 .env 里为不同知识库分配不同端口，减少探测开销。
 PORT_SCAN_RANGE = _env_int("DOC2KB_QUERY_PORT_SCAN_RANGE",         10)
 IDLE_TIMEOUT = _env_int("DOC2KB_QUERY_IDLE_TIMEOUT",               3600)
-# 冷启动等待时间：默认模型（bge-small-zh，约 100+MB）在有本地缓存的情况下
-# 加载通常几秒钟；但对于"刚分发给新用户、机器上还没有模型缓存"的场景，
-# 第一次调用需要从 HuggingFace（或镜像）下载模型，网络慢的话可能远超
-# 20 秒。原来固定等 20 秒超时，对首次运行的新用户不太友好——超时了但
-# server 其实还在正常下载/加载，稍等一下再试一次就好了，只是报错信息
-# 会让人以为出了什么故障。这里把等待时间和错误提示都做了调整。
 SERVER_START_TIMEOUT = _env_int("DOC2KB_QUERY_SERVER_START_TIMEOUT", 60)
 PID_FILE     = os.environ.get("DOC2KB_QUERY_PID_FILE", "")
-
-# 访问口令（可选）
 QUERY_AUTH_TOKEN = os.environ.get("DOC2KB_QUERY_AUTH_TOKEN", "").strip()
 
 
 def _db_identity() -> str:
-    """
-    用来判断"占用某个端口的 server 到底是不是我们自己这个知识库"的身份串。
-    必须是绝对路径（而不是每个 server 进程各自可能不同的相对路径原文），
-    否则同名但不同路径的两个知识库可能被误判为同一个。
-    """
     return str(DB_PATH.resolve())
 
 
 def _pid_file_for_port(port: int) -> Path:
     if PID_FILE:
-        # 用户显式配置了 PID_FILE：仍然按端口区分，避免同一份 .env 被
-        # 复制到多个知识库时，PID 文件互相覆盖导致 kill 错进程。
         base = Path(PID_FILE)
         return base.with_name(f"{base.stem}_{port}{base.suffix or '.pid'}")
     return _SKILL_DIR / f".server_{port}.pid"
@@ -215,7 +208,7 @@ def _expand_query(question: str) -> str:
 
 
 # ============================================================
-# Embedding 模型（单例 + 双重检查锁定）
+# Embedding 模型（单例 + 双重检查锁定 + 下载提示）
 # ============================================================
 
 _embedding_model      = None
@@ -227,17 +220,24 @@ def _get_embedding_model():
     if _embedding_model is None:
         with _embedding_model_lock:
             if _embedding_model is None:
+                print("=====================================================", file=sys.stderr)
+                print(f"[提示] 正在准备加载 Embedding 模型: [{EMBEDDING_MODEL}]", file=sys.stderr)
+                print(f"[提示] 若为首次运行，系统将自动从 HuggingFace 自动下载模型权重。", file=sys.stderr)
+                print(f"[提示] 下载过程视网络情况可能需要几分钟时间，请耐心等待，不要关闭程序...", file=sys.stderr)
+                print("=====================================================", file=sys.stderr)
+                
                 from fastembed import TextEmbedding
                 _embedding_model = TextEmbedding(
                     model_name=EMBEDDING_MODEL,
                     max_length=EMBEDDING_MAX_TOKENS,
                     enable_cpu_mem_arena=False,   # 避免长驻进程内存只增不减
                 )
+                
+                print(f"[提示] 模型 [{EMBEDDING_MODEL}] 加载完毕！", file=sys.stderr)
     return _embedding_model
 
 
 def _get_query_vector(model, question: str) -> list:
-    # query_embed() 会自动加 BGE 检索指令前缀，比通用 embed() 准确
     if hasattr(model, "query_embed"):
         vec = list(model.query_embed([question]))[0]
     else:
@@ -299,7 +299,7 @@ def _get_db_and_table():
         if not os.path.exists(db_path):
             raise FileNotFoundError(
                 f"知识库路径不存在: {db_path}\n"
-                f"请先在 doc2kb 项目里运行: python doc_pipeline.py build"
+                rf"请先在 doc2kb_query_skill\make_lancedb\doc2kb-main 项目里运行: python doc_pipeline.py build"
             )
         import lancedb
         _db    = lancedb.connect(db_path)
@@ -339,12 +339,6 @@ def _run_hybrid_search(table, query_vec: list, text: str, limit: int) -> list:
 
 def _do_search(question: str, search_text: str, query_vec: list,
                 top_k: int, threshold: float) -> dict:
-    """给定已经算好的 query_vec，执行 hybrid 检索并组装返回结构。
-    被 search() 和 search_batch() 共用，search_batch() 借此把"批量问题的
-    向量化"合并成一次调用，而不是每条问题各自单独过一次 embedding 模型
-    （fastembed 对批量输入做了内部向量化优化，逐条调用会白白浪费这部分
-    性能，问题数量越多、单条问题越短，浪费比例越明显）。
-    """
     _, table = _get_db_and_table()
     fetch_limit = max(top_k * 3, 10)
     try:
@@ -352,7 +346,6 @@ def _do_search(question: str, search_text: str, query_vec: list,
     except Exception as e:
         return {"found": False, "query": question, "results": [], "hits": 0, "error": f"检索失败: {e}"}
 
-    # 纯向量检索只用于获取真实余弦相似度（1 - cosine_distance），不参与排序
     try:
         vector_raw = table.search(query_vec).metric("cosine").limit(max(top_k * 4, 20)).to_list()
     except Exception:
@@ -370,7 +363,7 @@ def _do_search(question: str, search_text: str, query_vec: list,
         key = (r.get("source", ""), r.get("chunk_index"))
         sim = sim_lookup.get(key)
         if sim is None:
-            matched_by = "keyword"   # BM25 精确命中，不受余弦阈值限制
+            matched_by = "keyword" 
         else:
             matched_by = "hybrid"
             if sim < threshold:
@@ -435,7 +428,7 @@ def search(
 def search_batch(items: list[dict], top_k: int = TOP_K, threshold: float = SIMILARITY_THRESHOLD) -> list[dict]:
     _touch_activity()
     out: list[dict] = [None] * len(items)  # type: ignore[list-item]
-    valid: list[tuple[int, str, str]] = []  # (index, id, question)
+    valid: list[tuple[int, str, str]] = []  
 
     for i, item in enumerate(items):
         qid      = str(item.get("id", ""))
@@ -464,7 +457,6 @@ def search_batch(items: list[dict], top_k: int = TOP_K, threshold: float = SIMIL
         except Exception:
             search_texts.append(question)
 
-    # 一次性批量向量化整批问题，而不是每条问题各自调用一次 embedding 模型。
     try:
         if hasattr(model, "query_embed"):
             vecs = list(model.query_embed(search_texts))
@@ -532,7 +524,7 @@ def _idle_watcher(server: ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "doc2kb-skill/1.0"
+    server_version = "doc2kb_query_skill/1.0"
 
     def _send_json(self, code: int, payload: dict):
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -556,10 +548,6 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send_json(404, {"ok": False, "error": "not found"})
 
-    # 单条请求体大小上限：知识库问答场景下问题文本不会很大，给够 2MB 余量。
-    # 没有上限的话，任何能连到这个端口的客户端（哪怕只是写错了参数、传了个
-    # 巨大的文件内容当 question）都可能让 server 读一个超大的 body 占用内存，
-    # 尤其是分发出去之后不一定所有调用方的代码质量都能保证。
     _MAX_BODY_BYTES = 2 * 1024 * 1024
 
     def do_POST(self):
@@ -626,7 +614,6 @@ def run_server():
         server  = ThreadingHTTPServer((HOST, PORT), Handler)
         watcher = threading.Thread(target=_idle_watcher, args=(server,), daemon=True)
         watcher.start()
-        # 启动成功后打印一行 JSON，供调用方/父进程确认 server 已就绪
         print(json.dumps({
             "ok": True, "host": HOST, "port": PORT,
             "idle_timeout": IDLE_TIMEOUT, "pid": os.getpid(),
@@ -638,9 +625,6 @@ def run_server():
 
 
 def _server_health(host: str, port: int, timeout: float = 0.6) -> dict | None:
-    """探测某个端口上是否有一个正在响应的 doc2kb query server，返回它的
-    /health 信息（可用于判断这是不是"我们自己这个知识库"的 server）；
-    连不上或者不是我们这套接口，返回 None。"""
     import urllib.request
     import urllib.error
     try:
@@ -651,32 +635,13 @@ def _server_health(host: str, port: int, timeout: float = 0.6) -> dict | None:
 
 
 def _find_or_start_server() -> int:
-    """
-    找到（或拉起）一个服务于"我们这个知识库"的常驻 server，返回实际使用的端口。
-
-    背景：这个 skill 一般会被分发给不同的人 / 用在不同的知识库上，大家的
-    .env 大概率都是照抄 .env.example，默认端口全都是 8788。如果机器上同时
-    跑着多个知识库（比如同一台开发机上，张三配的是产品文档库，李四配的是
-    运维手册库，两人各自的 .env 只改了 DB_PATH 没改 PORT)，原来的逻辑只看
-    "端口有没有被占用"，一旦发现 8788 已经有进程在监听，就直接当成"我自己
-    的 server 已经在跑"去转发查询——完全不检查那个 server 服务的是不是同一
-    个知识库，会导致后启动的一方**静默查到别人的知识库内容**，而不会有
-    任何报错提示。
-
-    修复方式：在 [PORT, PORT+PORT_SCAN_RANGE) 范围内探测，只有 /health
-    返回的 db_path 和我们自己的知识库路径完全一致，才认定"可以复用"；
-    如果这个范围内没有找到匹配的，就在其中找一个当前空闲的端口，在那个
-    端口上拉起一个新 server（而不是直接用配置的端口硬冲突）。
-    """
     my_id = _db_identity()
 
-    # 1) 先看看扫描范围内有没有已经在跑、且正是服务这个知识库的 server
     for p in range(PORT, PORT + PORT_SCAN_RANGE):
         info = _server_health(HOST, p)
         if info is not None and info.get("db_path") == my_id:
             return p
 
-    # 2) 没有匹配的，找一个当前空闲的端口拉起新 server
     free_port = None
     for p in range(PORT, PORT + PORT_SCAN_RANGE):
         if _server_health(HOST, p) is None:
@@ -689,11 +654,11 @@ def _find_or_start_server() -> int:
             f"DOC2KB_QUERY_PORT_SCAN_RANGE，或换一个 DOC2KB_QUERY_PORT。"
         )
 
-    log_file = _SKILL_DIR / f".server_{free_port}.startup.log"
     cmd = [sys.executable, os.path.abspath(__file__), "--server",
            "--host", HOST, "--port", str(free_port)]
-    with open(log_file, "w", encoding="utf-8") as lf:
-        subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT)
+    
+    # 【改动】不再向 log_file 写日志文件，直接将 stdout 和 stderr 对接到系统控制台
+    subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr)
 
     deadline = time.time() + SERVER_START_TIMEOUT
     while time.time() < deadline:
@@ -702,18 +667,11 @@ def _find_or_start_server() -> int:
         if info is not None and info.get("db_path") == my_id:
             return free_port
 
-    # 超时：把子进程自己写的启动日志（比如缺依赖、模型下载失败等）附在
-    # 报错里，而不是原来那种"20 秒后报个 TimeoutError，什么原因都不知道"。
-    tail = ""
-    try:
-        tail = log_file.read_text(encoding="utf-8", errors="ignore")[-1500:]
-    except OSError:
-        pass
     raise TimeoutError(
         f"无法在 {HOST}:{free_port} 启动 server（等待 {SERVER_START_TIMEOUT}s 超时）。\n"
         f"若是首次运行且 embedding 模型还在下载，可以稍等后重试，"
         f"或调大 .env 里的 DOC2KB_QUERY_SERVER_START_TIMEOUT。\n"
-        f"启动日志（{log_file}）末尾内容：\n{tail or '(空)'}"
+        f"提示：请查看上方控制台的报错输出以获取具体失败原因。"
     )
 
 
@@ -723,7 +681,6 @@ def _find_or_start_server() -> int:
 
 def main():
     global HOST, PORT
-
     parser = argparse.ArgumentParser(description="doc2kb 知识库查询")
     parser.add_argument("--question", "-q",  help="问题文本")
     parser.add_argument("--batch",           help="批量问题 JSON 数组")
@@ -740,10 +697,6 @@ def main():
         run_server()
         return
 
-    # 非 server 模式：确保有一个服务于"当前这个知识库"的常驻 server 在跑
-    # （找不到匹配的就自动拉起一个，见 _find_or_start_server 的说明），
-    # 然后通过 HTTP 转发到它实际监听的端口——注意这不一定等于 PORT
-    # （配置的端口如果被别的知识库占了，会自动换一个空闲端口）。
     active_port = _find_or_start_server()
 
     import urllib.request

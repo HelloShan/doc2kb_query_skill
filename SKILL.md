@@ -27,7 +27,7 @@ skills:
 ```bash
 cd doc2kb_query/scripts
 cp .env.example .env
-# 编辑 .env，至少把 DOC2KB_QUERY_DB_PATH 改成知识库的绝对路径
+# 编辑 .env，把 DOC2KB_QUERY_DB_PATH 改成知识库的绝对路径，避免执行脚本当前路径变动时出错
 # 以及把 DOC2KB_QUERY_EMBEDDING_MODEL 改成构建时用的模型
 ```
 
