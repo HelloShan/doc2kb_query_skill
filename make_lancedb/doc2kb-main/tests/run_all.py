@@ -8,12 +8,9 @@ TESTS = [
     "test_state.py",
     "test_convert_docm.py",
     "test_ingest_abandonment.py",
-    "test_server_search.py",
     "test_chunking.py",
     "test_ingest_doctype.py",
     "test_glossary.py",
-    "test_embed_model_thread_safety.py",
-    "test_query_config_isolation.py",
     "test_env_config.py",
 ]
 

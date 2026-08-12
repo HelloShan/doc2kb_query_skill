@@ -245,12 +245,35 @@ class PipelineState:
             self._dirty = True
 
     def reset_file(self, rel_path: str):
-        """重置文件状态为待处理。"""
+        """
+        把一个文件重置为"需要重新处理"。
+
+        只重置真正处于失败/未处理状态的那个阶段（garbled/empty/error/
+        pending），已经成功的阶段（ok/skip）保持不动。
+
+        这是修复一个真实存在的 bug：旧版本不分青红皂白，把 conversion 和
+        ingestion 两个阶段的状态全部无条件清回 pending。这在 --convert-only
+        场景下（入库阶段根本还没跑，所有文件的 ingestion.status 天然就是
+        "pending"）会导致严重问题：只要某个文件的转换早就成功了
+        （conversion: ok），只要它还没入库（ingestion: pending —— 这是完全
+        正常的中间状态，不是失败），也会被 get_failed_files() 当成"失败"
+        抓进来，然后被这里无差别重置——刚转换成功的文件，转换状态被
+        retry 自己打回 pending。每跑一次 retry 就会把上一批刚成功、还没
+        入库的文件重新打回原形，进度永远攒不起来，看起来像是"跑多少次
+        都还是那么多文件待处理"。
+        """
         entry = self._data["files"].get(rel_path)
-        if entry:
+        if not entry:
+            return
+        conv_status = entry.get("conversion", {}).get("status")
+        ing_status = entry.get("ingestion", {}).get("status")
+        # 只有"确实不是成功状态"的阶段才需要重置；已经 ok/skip 的阶段，
+        # 不管另一个阶段是什么情况，都不应该被这里连带清空。
+        if conv_status not in (ST_OK, ST_SKIP):
             entry["conversion"] = make_conversion_record(ST_PENDING)
+        if ing_status not in (ST_OK, ST_SKIP):
             entry["ingestion"] = make_ingestion_record(ST_PENDING)
-            self._dirty = True
+        self._dirty = True
 
     # ---- 批量查询 ----
 
