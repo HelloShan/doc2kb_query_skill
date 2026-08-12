@@ -2,15 +2,14 @@
 """
 doc2kb 知识库查询 —— 自包含 Skill 脚本
 ========================================
-  - 常驻 HTTP server（模型只加载一次）
+  - 常驻 HTTP server（预加载数据库与 Embedding 模型）
   - 自动拉起（首次查询检测到没有 server 时在后台启动）
   - hybrid 检索（向量 + BM25 + RRF 融合）
   - 访问口令鉴权
   - 术语表展开
   - 向量维度运行时自检
 
-完全独立，不依赖 doc2kb 项目的任何路径或模块。
-配置通过本文件同目录下的 .env 读取（参考 .env.example）。
+配置通过本文件同目录下的 .env 读取。
 
 用法:
   # 单题查询（自动拉起常驻 server，后续查询复用同一进程）
@@ -20,7 +19,7 @@ doc2kb 知识库查询 —— 自包含 Skill 脚本
   # 批量查询
   python query.py --batch '[{"id":"1","question":"问题A"},{"id":"2","question":"问题B"}]'
 
-  # 手动启动常驻服务（通常不需要，CLI 调用会自动拉起）
+  # 手动启动常驻服务
   python query.py --server
 """
 
@@ -35,28 +34,30 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple
 
 # ============================================================
-# 配置：从本文件同目录下的 .env 读取，不依赖项目根目录
+# 配置与路径初始化：严格读取脚本同级目录下的 .env
 # ============================================================
 
-_SKILL_DIR = Path(__file__).resolve().parent.parent
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 try:
     from dotenv import load_dotenv
-    load_dotenv(_SKILL_DIR / ".env")
+    load_dotenv(SCRIPT_DIR / ".env")
 except ImportError:
-    # dotenv 未安装时降级：手动解析 .env 文件
-    _env_file = _SKILL_DIR / ".env"
+    # dotenv 未安装时的降级方案：解析同级 .env 文件
+    _env_file = SCRIPT_DIR / ".env"
     if _env_file.exists():
-        for _line in _env_file.read_text(encoding="utf-8").splitlines():
-            _line = _line.strip()
-            if _line and not _line.startswith("#") and "=" in _line:
-                _k, _, _v = _line.partition("=")
-                os.environ.setdefault(_k.strip(), _v.strip())
+        for line in _env_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, v = line.partition("=")
+                os.environ.setdefault(k.strip(), v.strip())
 
 
 def _env_int(name: str, default: int) -> int:
@@ -76,29 +77,46 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _resolve_path(raw: str) -> Path:
+    if not raw:
+        return Path()
     p = Path(raw)
-    return p if p.is_absolute() else (_SKILL_DIR / p)
+    return p if p.is_absolute() else (SCRIPT_DIR / p)
 
 
-# ============================================================
-# 必填知识库身份参数（移除默认值，为空时直接提示并退出）
-# ============================================================
-_raw_db_path      = os.environ.get("DOC2KB_QUERY_DB_PATH", "").strip()
-_raw_table_name   = os.environ.get("DOC2KB_QUERY_TABLE_NAME", "").strip()
-_raw_model        = os.environ.get("DOC2KB_QUERY_EMBEDDING_MODEL", "").strip()
-_raw_max_tokens   = os.environ.get("DOC2KB_QUERY_EMBEDDING_MAX_TOKENS", "").strip()
-_raw_glossary     = os.environ.get("DOC2KB_QUERY_GLOSSARY_PATH", "").strip()
+# 读取缓存目录设置，并设置相关环境变量
+_raw_cache_dir = os.environ.get("DOC2KB_QUERY_CACHE_DIR", "").strip()
+CACHE_DIR: Optional[Path] = _resolve_path(_raw_cache_dir) if _raw_cache_dir else None
+
+if CACHE_DIR:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    os.environ["FASTEMBED_CACHE_PATH"] = str(CACHE_DIR)
+    os.environ["HF_HOME"] = str(CACHE_DIR)
+
+# 必填参数校验
+_raw_db_path = os.environ.get("DOC2KB_QUERY_DB_PATH", "").strip()
+_raw_table_name = os.environ.get("DOC2KB_QUERY_TABLE_NAME", "").strip()
+_raw_model = os.environ.get("DOC2KB_QUERY_EMBEDDING_MODEL", "").strip()
+_raw_max_tokens = os.environ.get("DOC2KB_QUERY_EMBEDDING_MAX_TOKENS", "").strip()
+_raw_glossary = os.environ.get("DOC2KB_QUERY_GLOSSARY_PATH", "").strip()
+
+# HuggingFace 镜像源配置
+os.environ.setdefault("HF_ENDPOINT", os.getenv("DOC2KB_HF_ENDPOINT", "https://hf-mirror.com"))
 
 _missing_configs = []
-if not _raw_db_path:     _missing_configs.append("DOC2KB_QUERY_DB_PATH")
-if not _raw_table_name:  _missing_configs.append("DOC2KB_QUERY_TABLE_NAME")
-if not _raw_model:       _missing_configs.append("DOC2KB_QUERY_EMBEDDING_MODEL")
-if not _raw_max_tokens:  _missing_configs.append("DOC2KB_QUERY_EMBEDDING_MAX_TOKENS")
-if not _raw_glossary:    _missing_configs.append("DOC2KB_QUERY_GLOSSARY_PATH")
+if not _raw_db_path:
+    _missing_configs.append("DOC2KB_QUERY_DB_PATH")
+if not _raw_table_name:
+    _missing_configs.append("DOC2KB_QUERY_TABLE_NAME")
+if not _raw_model:
+    _missing_configs.append("DOC2KB_QUERY_EMBEDDING_MODEL")
+if not _raw_max_tokens:
+    _missing_configs.append("DOC2KB_QUERY_EMBEDDING_MAX_TOKENS")
+if not _raw_glossary:
+    _missing_configs.append("DOC2KB_QUERY_GLOSSARY_PATH")
 
 if _missing_configs:
     print("=====================================================", file=sys.stderr)
-    print("[错误] 程序启动失败！检测到以下必要配置为空，请检查环境变量或 .env 设置：", file=sys.stderr)
+    print("[错误] 程序启动失败！检测到以下必要配置为空，请检查 .env 设置：", file=sys.stderr)
     for m in _missing_configs:
         print(f" -> 缺少配置: {m}", file=sys.stderr)
     print("=====================================================", file=sys.stderr)
@@ -107,27 +125,24 @@ if _missing_configs:
 try:
     EMBEDDING_MAX_TOKENS = int(_raw_max_tokens)
 except ValueError:
-    print(f"[错误] DOC2KB_QUERY_EMBEDDING_MAX_TOKENS 必须是整数格式，当前值: {_raw_max_tokens}", file=sys.stderr)
+    print(f"[错误] DOC2KB_QUERY_EMBEDDING_MAX_TOKENS 必须是整数，当前值: {_raw_max_tokens}", file=sys.stderr)
     sys.exit(1)
 
-DB_PATH       = _resolve_path(_raw_db_path)
-TABLE_NAME    = _raw_table_name
+DB_PATH = _resolve_path(_raw_db_path)
+TABLE_NAME = _raw_table_name
 EMBEDDING_MODEL = _raw_model
 GLOSSARY_PATH = _resolve_path(_raw_glossary)
 
-
-# ============================================================
-# 可选/其它检索参数与服务监听配置
-# ============================================================
-TOP_K               = _env_int("DOC2KB_QUERY_TOP_K",              5)
+# 可选检索及服务参数
+TOP_K = _env_int("DOC2KB_QUERY_TOP_K", 5)
 SIMILARITY_THRESHOLD = _env_float("DOC2KB_QUERY_SIMILARITY_THRESHOLD", 0.5)
 
-HOST         = os.environ.get("DOC2KB_QUERY_HOST",                 "127.0.0.1")
-PORT         = _env_int("DOC2KB_QUERY_PORT",                       8788)
-PORT_SCAN_RANGE = _env_int("DOC2KB_QUERY_PORT_SCAN_RANGE",         10)
-IDLE_TIMEOUT = _env_int("DOC2KB_QUERY_IDLE_TIMEOUT",               3600)
+HOST = os.environ.get("DOC2KB_QUERY_HOST", "127.0.0.1")
+PORT = _env_int("DOC2KB_QUERY_PORT", 8788)
+PORT_SCAN_RANGE = _env_int("DOC2KB_QUERY_PORT_SCAN_RANGE", 10)
+IDLE_TIMEOUT = _env_int("DOC2KB_QUERY_IDLE_TIMEOUT", 3600)
 SERVER_START_TIMEOUT = _env_int("DOC2KB_QUERY_SERVER_START_TIMEOUT", 60)
-PID_FILE     = os.environ.get("DOC2KB_QUERY_PID_FILE", "")
+PID_FILE = os.environ.get("DOC2KB_QUERY_PID_FILE", "")
 QUERY_AUTH_TOKEN = os.environ.get("DOC2KB_QUERY_AUTH_TOKEN", "").strip()
 
 
@@ -139,20 +154,20 @@ def _pid_file_for_port(port: int) -> Path:
     if PID_FILE:
         base = Path(PID_FILE)
         return base.with_name(f"{base.stem}_{port}{base.suffix or '.pid'}")
-    return _SKILL_DIR / f".server_{port}.pid"
+    return SCRIPT_DIR / f".server_{port}.pid"
 
 
 # ============================================================
-# 术语表展开（内嵌，不依赖外部 glossary.py）
+# 术语表展开
 # ============================================================
 
-_glossary_cache: dict = {}
-_glossary_lock  = threading.Lock()
+_glossary_cache: Dict[str, Tuple[Dict[str, Any], float]] = {}
+_glossary_lock = threading.Lock()
 
 
-def _load_glossary() -> dict:
+def _load_glossary() -> Dict[str, Any]:
     path = GLOSSARY_PATH
-    key  = str(path.resolve())
+    key = str(path.resolve())
     with _glossary_lock:
         if not path.exists():
             return {}
@@ -165,19 +180,19 @@ def _load_glossary() -> dict:
             raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
             if not isinstance(raw, dict):
                 return {}
-            parsed: dict = {}
+            parsed: Dict[str, Any] = {}
             for term, info in raw.items():
                 if not isinstance(term, str):
                     continue
                 if isinstance(info, dict):
-                    full    = info.get("full", "")
+                    full = info.get("full", "")
                     aliases = info.get("aliases", []) or []
                 elif isinstance(info, str):
                     full, aliases = info, []
                 else:
                     continue
                 parsed[term] = {
-                    "full":    full,
+                    "full": full,
                     "aliases": [a for a in aliases if isinstance(a, str)],
                 }
             _glossary_cache[key] = (parsed, mtime)
@@ -190,8 +205,8 @@ def _expand_query(question: str) -> str:
     glossary = _load_glossary()
     if not glossary:
         return question
-    extra: list[str] = []
-    seen:  set[str]  = set()
+    extra: List[str] = []
+    seen: set[str] = set()
     for term, info in glossary.items():
         pat = re.compile(
             rf"\b{re.escape(term)}\b" if term.isascii() else re.escape(term),
@@ -208,10 +223,10 @@ def _expand_query(question: str) -> str:
 
 
 # ============================================================
-# Embedding 模型（单例 + 双重检查锁定 + 下载提示）
+# Embedding 模型管理 (单例 + 支持指定缓存目录)
 # ============================================================
 
-_embedding_model      = None
+_embedding_model = None
 _embedding_model_lock = threading.Lock()
 
 
@@ -221,23 +236,27 @@ def _get_embedding_model():
         with _embedding_model_lock:
             if _embedding_model is None:
                 print("=====================================================", file=sys.stderr)
-                print(f"[提示] 正在准备加载 Embedding 模型: [{EMBEDDING_MODEL}]", file=sys.stderr)
-                print(f"[提示] 若为首次运行，系统将自动从 HuggingFace 自动下载模型权重。", file=sys.stderr)
-                print(f"[提示] 下载过程视网络情况可能需要几分钟时间，请耐心等待，不要关闭程序...", file=sys.stderr)
+                print(f"[提示] 正在初始化 Embedding 模型: [{EMBEDDING_MODEL}]", file=sys.stderr)
+                if CACHE_DIR:
+                    print(f"[提示] 使用模型缓存目录: [{CACHE_DIR}]", file=sys.stderr)
                 print("=====================================================", file=sys.stderr)
-                
+
                 from fastembed import TextEmbedding
-                _embedding_model = TextEmbedding(
-                    model_name=EMBEDDING_MODEL,
-                    max_length=EMBEDDING_MAX_TOKENS,
-                    enable_cpu_mem_arena=False,   # 避免长驻进程内存只增不减
-                )
-                
+
+                init_kwargs: Dict[str, Any] = {
+                    "model_name": EMBEDDING_MODEL,
+                    "max_length": EMBEDDING_MAX_TOKENS,
+                    "enable_cpu_mem_arena": False,  # 避免长驻进程内存持续增长
+                }
+                if CACHE_DIR:
+                    init_kwargs["cache_dir"] = str(CACHE_DIR)
+
+                _embedding_model = TextEmbedding(**init_kwargs)
                 print(f"[提示] 模型 [{EMBEDDING_MODEL}] 加载完毕！", file=sys.stderr)
     return _embedding_model
 
 
-def _get_query_vector(model, question: str) -> list:
+def _get_query_vector(model: Any, question: str) -> List[float]:
     if hasattr(model, "query_embed"):
         vec = list(model.query_embed([question]))[0]
     else:
@@ -246,13 +265,13 @@ def _get_query_vector(model, question: str) -> list:
 
 
 # ============================================================
-# 向量维度运行时自检（防止构建/查询模型配置不一致）
+# 向量维度运行时自检
 # ============================================================
 
 _dim_checked = False
 
 
-def _validate_vector_dim(table):
+def _validate_vector_dim(table: Any) -> None:
     global _dim_checked
     if _dim_checked:
         return
@@ -262,60 +281,53 @@ def _validate_vector_dim(table):
         _dim_checked = True
         return
 
-    model     = _get_embedding_model()
-    probe_vec = list(
-        model.query_embed(["dim_check"]) if hasattr(model, "query_embed")
-        else model.embed(["dim_check"], batch_size=1)
-    )[0]
+    model = _get_embedding_model()
+    probe_vec = _get_query_vector(model, "dim_check")
     probe_dim = len(probe_vec)
 
     if probe_dim != table_dim:
         raise ValueError(
             f"维度不匹配：当前模型 {EMBEDDING_MODEL!r} 输出 {probe_dim} 维，"
             f"但知识库里存的向量是 {table_dim} 维。"
-            f"请检查 .env 里的 DOC2KB_QUERY_EMBEDDING_MODEL 是否和构建时一致，"
-            f"同时确认 DOC2KB_QUERY_EMBEDDING_MAX_TOKENS 也对应修改。"
+            f"请检查 .env 里的 DOC2KB_QUERY_EMBEDDING_MODEL 是否和构建时一致。"
         )
     _dim_checked = True
 
 
 # ============================================================
-# LanceDB 连接（惰性单例）
+# LanceDB 连接管理
 # ============================================================
 
-_db    = None
+_db = None
 _table = None
 _db_lock = threading.Lock()
 
 
-def _get_db_and_table():
+def _get_db_and_table() -> Tuple[Any, Any]:
     global _db, _table
     if _table is not None:
         return _db, _table
     with _db_lock:
         if _table is not None:
             return _db, _table
-        db_path = str(DB_PATH)
-        if not os.path.exists(db_path):
-            raise FileNotFoundError(
-                f"知识库路径不存在: {db_path}\n"
-                rf"请先在 doc2kb_query_skill\make_lancedb\doc2kb-main 项目里运行: python doc_pipeline.py build"
-            )
+        db_path_str = str(DB_PATH)
+        if not os.path.exists(db_path_str):
+            raise FileNotFoundError(f"知识库路径不存在: {db_path_str}")
         import lancedb
-        _db    = lancedb.connect(db_path)
+        _db = lancedb.connect(db_path_str)
         _table = _db.open_table(TABLE_NAME)
         _validate_vector_dim(_table)
     return _db, _table
 
 
 # ============================================================
-# 核心 hybrid 检索
+# 核心检索逻辑
 # ============================================================
 
 _FTS_MISSING = ("inverted index", "full text search")
 
 
-def _run_hybrid_search(table, query_vec: list, text: str, limit: int) -> list:
+def _run_hybrid_search(table: Any, query_vec: List[float], text: str, limit: int) -> List[Dict[str, Any]]:
     from lancedb.rerankers import RRFReranker
 
     def _do():
@@ -337,8 +349,7 @@ def _run_hybrid_search(table, query_vec: list, text: str, limit: int) -> list:
         raise
 
 
-def _do_search(question: str, search_text: str, query_vec: list,
-                top_k: int, threshold: float) -> dict:
+def _do_search(question: str, search_text: str, query_vec: List[float], top_k: int, threshold: float) -> Dict[str, Any]:
     _, table = _get_db_and_table()
     fetch_limit = max(top_k * 3, 10)
     try:
@@ -351,10 +362,10 @@ def _do_search(question: str, search_text: str, query_vec: list,
     except Exception:
         vector_raw = []
 
-    sim_lookup: dict = {}
+    sim_lookup: Dict[Tuple[str, Any], float] = {}
     for r in vector_raw:
         key = (r.get("source", ""), r.get("chunk_index"))
-        d   = r.get("_distance")
+        d = r.get("_distance")
         if d is not None:
             sim_lookup[key] = round(1.0 - d, 4)
 
@@ -363,18 +374,18 @@ def _do_search(question: str, search_text: str, query_vec: list,
         key = (r.get("source", ""), r.get("chunk_index"))
         sim = sim_lookup.get(key)
         if sim is None:
-            matched_by = "keyword" 
+            matched_by = "keyword"
         else:
             matched_by = "hybrid"
             if sim < threshold:
                 continue
         filtered.append({
-            "text":       r.get("text", "").strip(),
-            "source":     r.get("source", ""),
-            "file_name":  os.path.basename(r.get("source", "未知")),
+            "text": r.get("text", "").strip(),
+            "source": r.get("source", ""),
+            "file_name": os.path.basename(r.get("source", "未知")),
             "similarity": sim,
             "matched_by": matched_by,
-            "doc_type":   r.get("doc_type", "doc"),
+            "doc_type": r.get("doc_type", "doc"),
         })
     filtered = filtered[:top_k]
 
@@ -384,27 +395,23 @@ def _do_search(question: str, search_text: str, query_vec: list,
     elif not numeric_sims:
         best, confidence = None, "medium"
     else:
-        best       = numeric_sims[0]
+        best = numeric_sims[0]
         confidence = "high" if best >= 0.75 else "medium" if best >= 0.55 else "low"
 
-    result: dict = {
-        "found":            len(filtered) > 0,
-        "query":            question,
-        "results":          filtered,
-        "hits":             len(filtered),
-        "best_similarity":  round(best, 4) if isinstance(best, float) else best,
-        "confidence":       confidence,
+    result: Dict[str, Any] = {
+        "found": len(filtered) > 0,
+        "query": question,
+        "results": filtered,
+        "hits": len(filtered),
+        "best_similarity": round(best, 4) if isinstance(best, float) else best,
+        "confidence": confidence,
     }
     if search_text != question:
         result["expanded_query"] = search_text
     return result
 
 
-def search(
-    question: str,
-    top_k: int = TOP_K,
-    threshold: float = SIMILARITY_THRESHOLD,
-) -> dict:
+def search(question: str, top_k: int = TOP_K, threshold: float = SIMILARITY_THRESHOLD) -> Dict[str, Any]:
     _touch_activity()
     try:
         _get_db_and_table()
@@ -425,13 +432,13 @@ def search(
     return _do_search(question, search_text, query_vec, top_k, threshold)
 
 
-def search_batch(items: list[dict], top_k: int = TOP_K, threshold: float = SIMILARITY_THRESHOLD) -> list[dict]:
+def search_batch(items: List[Dict[str, Any]], top_k: int = TOP_K, threshold: float = SIMILARITY_THRESHOLD) -> List[Dict[str, Any]]:
     _touch_activity()
-    out: list[dict] = [None] * len(items)  # type: ignore[list-item]
-    valid: list[tuple[int, str, str]] = []  
+    out: List[Dict[str, Any]] = [None] * len(items)  # type: ignore
+    valid: List[Tuple[int, str, str]] = []
 
     for i, item in enumerate(items):
-        qid      = str(item.get("id", ""))
+        qid = str(item.get("id", ""))
         question = str(item.get("question", "")).strip()
         if not question:
             out[i] = {"id": qid, "error": "empty question", "found": False, "results": [], "hits": 0}
@@ -439,7 +446,7 @@ def search_batch(items: list[dict], top_k: int = TOP_K, threshold: float = SIMIL
             valid.append((i, qid, question))
 
     if not valid:
-        return out  # type: ignore[return-value]
+        return out
 
     try:
         _get_db_and_table()
@@ -448,7 +455,7 @@ def search_batch(items: list[dict], top_k: int = TOP_K, threshold: float = SIMIL
         err = {"error": str(e), "found": False, "results": [], "hits": 0}
         for i, qid, question in valid:
             out[i] = {"id": qid, "query": question, **err}
-        return out  # type: ignore[return-value]
+        return out
 
     search_texts = []
     for _, _, question in valid:
@@ -467,17 +474,17 @@ def search_batch(items: list[dict], top_k: int = TOP_K, threshold: float = SIMIL
         err_msg = f"向量化失败: {e}"
         for (i, qid, question), search_text in zip(valid, search_texts):
             out[i] = {"id": qid, "query": question, "error": err_msg, "found": False, "results": [], "hits": 0}
-        return out  # type: ignore[return-value]
+        return out
 
     for (i, qid, question), search_text, vec in zip(valid, search_texts, vecs):
         r = _do_search(question, search_text, vec, top_k, threshold)
         r["id"] = qid
         out[i] = r
 
-    return out  # type: ignore[return-value]
+    return out
 
 
-def format_as_context(results: list[dict]) -> str:
+def format_as_context(results: List[Dict[str, Any]]) -> str:
     if not results:
         return "[知识库检索无结果]"
     parts = []
@@ -491,19 +498,19 @@ def format_as_context(results: list[dict]) -> str:
 
 
 # ============================================================
-# 常驻 HTTP Server
+# HTTP 常驻 Server 模块
 # ============================================================
 
 _server_start = time.time()
 _last_activity = time.time()
 
 
-def _touch_activity():
+def _touch_activity() -> None:
     global _last_activity
     _last_activity = time.time()
 
 
-def _check_auth(auth_header: str | None) -> bool:
+def _check_auth(auth_header: Optional[str]) -> bool:
     if not QUERY_AUTH_TOKEN:
         return True
     if not auth_header or not auth_header.startswith("Bearer "):
@@ -511,7 +518,7 @@ def _check_auth(auth_header: str | None) -> bool:
     return hmac.compare_digest(auth_header[len("Bearer "):].strip(), QUERY_AUTH_TOKEN)
 
 
-def _idle_watcher(server: ThreadingHTTPServer):
+def _idle_watcher(server: ThreadingHTTPServer) -> None:
     while True:
         time.sleep(5)
         if (time.time() - _last_activity) >= IDLE_TIMEOUT:
@@ -525,8 +532,9 @@ def _idle_watcher(server: ThreadingHTTPServer):
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "doc2kb_query_skill/1.0"
+    _MAX_BODY_BYTES = 2 * 1024 * 1024
 
-    def _send_json(self, code: int, payload: dict):
+    def _send_json(self, code: int, payload: Dict[str, Any]) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -534,7 +542,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def do_GET(self):
+    def do_GET(self) -> None:
         _touch_activity()
         if self.path == "/health":
             self._send_json(200, {
@@ -548,9 +556,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send_json(404, {"ok": False, "error": "not found"})
 
-    _MAX_BODY_BYTES = 2 * 1024 * 1024
-
-    def do_POST(self):
+    def do_POST(self) -> None:
         _touch_activity()
         if not _check_auth(self.headers.get("Authorization")):
             self._send_json(401, {"ok": False, "error": "unauthorized"})
@@ -560,15 +566,16 @@ class Handler(BaseHTTPRequestHandler):
         if length > self._MAX_BODY_BYTES:
             self._send_json(413, {"ok": False, "error": f"请求体过大（>{self._MAX_BODY_BYTES} 字节）"})
             return
-        body   = self.rfile.read(length) if length > 0 else b"{}"
+
+        body = self.rfile.read(length) if length > 0 else b"{}"
         try:
             payload = json.loads(body.decode("utf-8"))
         except Exception as e:
             self._send_json(400, {"ok": False, "error": f"invalid json: {e}"})
             return
 
-        action    = payload.get("action", "search")
-        top_k     = int(payload.get("top_k", TOP_K))
+        action = payload.get("action", "search")
+        top_k = int(payload.get("top_k", TOP_K))
         threshold = float(payload.get("threshold", SIMILARITY_THRESHOLD))
 
         if action == "search":
@@ -581,18 +588,18 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send_json(400, {"ok": False, "error": f"unknown action: {action}"})
 
-    def log_message(self, format, *args):
-        pass  # 静默 HTTP 日志
+    def log_message(self, format: str, *args: Any) -> None:
+        pass  # 禁用标准 HTTP 日志输出
 
 
-def _write_pid(port: int):
+def _write_pid(port: int) -> None:
     try:
         _pid_file_for_port(port).write_text(str(os.getpid()), encoding="utf-8")
     except Exception:
         pass
 
 
-def _remove_pid(port: int):
+def _remove_pid(port: int) -> None:
     try:
         p = _pid_file_for_port(port)
         if p.exists():
@@ -601,32 +608,51 @@ def _remove_pid(port: int):
         pass
 
 
-def run_server():
-    """启动常驻 HTTP server（阻塞）。"""
+def run_server() -> None:
+    """启动常驻 HTTP Server（启动时自动预加载知识库与 Embedding 模型）。"""
+    print("[INFO] 正在预加载知识库与 Embedding 模型...", file=sys.stderr)
+    try:
+        _get_db_and_table()
+        _get_embedding_model()
+        print("[INFO] 预加载完成，开始监听 HTTP 请求...", file=sys.stderr)
+    except Exception as e:
+        print(f"[错误] 预加载失败，服务退出: {e}", file=sys.stderr)
+        sys.exit(1)
+
     _write_pid(PORT)
     if not QUERY_AUTH_TOKEN and HOST not in ("127.0.0.1", "localhost", "::1"):
         print(
-            f"[WARN] 未设置 DOC2KB_QUERY_AUTH_TOKEN，且监听地址是 {HOST}，"
-            f"任何能访问此端口的人都可以查询知识库内容。",
+            f"[WARN] 未设置 DOC2KB_QUERY_AUTH_TOKEN，且监听地址为 {HOST}，注意接口暴露风险！",
             file=sys.stderr,
         )
+
     try:
-        server  = ThreadingHTTPServer((HOST, PORT), Handler)
+        server = ThreadingHTTPServer((HOST, PORT), Handler)
         watcher = threading.Thread(target=_idle_watcher, args=(server,), daemon=True)
         watcher.start()
-        print(json.dumps({
-            "ok": True, "host": HOST, "port": PORT,
-            "idle_timeout": IDLE_TIMEOUT, "pid": os.getpid(),
-            "db_path": _db_identity(), "model": EMBEDDING_MODEL,
-        }, ensure_ascii=False), flush=True)
+
+        # 打印服务启动成功的标准 JSON
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "host": HOST,
+                    "port": PORT,
+                    "idle_timeout": IDLE_TIMEOUT,
+                    "pid": os.getpid(),
+                    "db_path": _db_identity(),
+                    "model": EMBEDDING_MODEL,
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
         server.serve_forever(poll_interval=1)
     finally:
         _remove_pid(PORT)
 
 
-def _server_health(host: str, port: int, timeout: float = 0.6) -> dict | None:
-    import urllib.request
-    import urllib.error
+def _server_health(host: str, port: int, timeout: float = 0.6) -> Optional[Dict[str, Any]]:
     try:
         with urllib.request.urlopen(f"http://{host}:{port}/health", timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
@@ -637,27 +663,34 @@ def _server_health(host: str, port: int, timeout: float = 0.6) -> dict | None:
 def _find_or_start_server() -> int:
     my_id = _db_identity()
 
+    # 1. 检查已有运行中的服务
     for p in range(PORT, PORT + PORT_SCAN_RANGE):
         info = _server_health(HOST, p)
         if info is not None and info.get("db_path") == my_id:
             return p
 
+    # 2. 寻找空闲端口启动新服务
     free_port = None
     for p in range(PORT, PORT + PORT_SCAN_RANGE):
         if _server_health(HOST, p) is None:
             free_port = p
             break
+
     if free_port is None:
         raise RuntimeError(
-            f"端口 {PORT}-{PORT + PORT_SCAN_RANGE - 1} 都已被其它 server 占用，"
-            f"且都不是当前知识库（{my_id}）。请在 .env 里调大 "
-            f"DOC2KB_QUERY_PORT_SCAN_RANGE，或换一个 DOC2KB_QUERY_PORT。"
+            f"端口 {PORT}-{PORT + PORT_SCAN_RANGE - 1} 均被占用，且不属于当前知识库。"
         )
 
-    cmd = [sys.executable, os.path.abspath(__file__), "--server",
-           "--host", HOST, "--port", str(free_port)]
-    
-    # 【改动】不再向 log_file 写日志文件，直接将 stdout 和 stderr 对接到系统控制台
+    cmd = [
+        sys.executable,
+        os.path.abspath(__file__),
+        "--server",
+        "--host",
+        HOST,
+        "--port",
+        str(free_port),
+    ]
+
     subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr)
 
     deadline = time.time() + SERVER_START_TIMEOUT
@@ -667,27 +700,22 @@ def _find_or_start_server() -> int:
         if info is not None and info.get("db_path") == my_id:
             return free_port
 
-    raise TimeoutError(
-        f"无法在 {HOST}:{free_port} 启动 server（等待 {SERVER_START_TIMEOUT}s 超时）。\n"
-        f"若是首次运行且 embedding 模型还在下载，可以稍等后重试，"
-        f"或调大 .env 里的 DOC2KB_QUERY_SERVER_START_TIMEOUT。\n"
-        f"提示：请查看上方控制台的报错输出以获取具体失败原因。"
-    )
+    raise TimeoutError(f"启动常驻 Server 超时（>{SERVER_START_TIMEOUT}s）。")
 
 
 # ============================================================
 # CLI 入口
 # ============================================================
 
-def main():
+def main() -> None:
     global HOST, PORT
     parser = argparse.ArgumentParser(description="doc2kb 知识库查询")
-    parser.add_argument("--question", "-q",  help="问题文本")
-    parser.add_argument("--batch",           help="批量问题 JSON 数组")
+    parser.add_argument("--question", "-q", help="问题文本")
+    parser.add_argument("--batch", help="批量问题 JSON 数组")
     parser.add_argument("--format", choices=["json", "context"], default="json")
     parser.add_argument("--server", action="store_true", help="启动常驻检索服务")
-    parser.add_argument("--host",   default=HOST)
-    parser.add_argument("--port",   type=int, default=PORT)
+    parser.add_argument("--host", default=HOST)
+    parser.add_argument("--port", type=int, default=PORT)
     args = parser.parse_args()
 
     HOST = args.host
@@ -699,19 +727,18 @@ def main():
 
     active_port = _find_or_start_server()
 
-    import urllib.request
     if args.batch:
-        payload: dict[str, Any] = {
+        payload: Dict[str, Any] = {
             "action": "batch",
             "items": json.loads(args.batch),
         }
     elif args.question:
         payload = {
-            "action":   "context" if args.format == "context" else "search",
+            "action": "context" if args.format == "context" else "search",
             "question": args.question,
         }
     else:
-        parser.error("--question 和 --batch 至少需要一个")
+        parser.error("--question 和 --batch 至少需要指定一个")
 
     req = urllib.request.Request(
         f"http://{HOST}:{active_port}/",
@@ -722,6 +749,7 @@ def main():
         },
         method="POST",
     )
+
     with urllib.request.urlopen(req, timeout=120) as resp:
         data = json.loads(resp.read().decode("utf-8"))
 

@@ -3,6 +3,7 @@ __pycache__/
 *.log
 .DS_Store
 __pycache__
+*.pid
 
 # 真实配置文件不提交，仓库里只保留 .env.example 作为样例
 .env
@@ -11,6 +12,6 @@ __pycache__
 make_lancedb/output_md/
 make_lancedb/source_docs/
 make_lancedb/*.lancedb/
+make_lancedb/model_cache/
 make_lancedb/pipeline_state.json
 make_lancedb/doc2kb-main/.env
-make_lancedb/.retrieval_server.pid

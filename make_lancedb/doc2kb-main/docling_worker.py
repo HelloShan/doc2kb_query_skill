@@ -11,8 +11,6 @@ import sys
 import json
 import os
 
-# 启动时先设好镜像源
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 
 def main():
