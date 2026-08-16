@@ -56,6 +56,22 @@ def _ensure_output_dir(output_path: Path):
 
 
 # ============================================================
+# 内存优化配置 - 分页批量处理大文件
+# ============================================================
+
+# PDF 分页处理配置：每次处理的最大页数
+PDF_BATCH_PAGE_SIZE = 10  # 每批处理50页，减少内存占用
+
+# Excel 分批处理配置：每次处理的最大行数
+EXCEL_BATCH_ROW_SIZE = 5000  # 每批处理10000行
+
+# 临时文件目录
+import tempfile as _tempfile
+TEMP_DIR = Path(_tempfile.gettempdir()) / "doc2kb_convert"
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ============================================================
 # Docling 引擎（主力）
 # ============================================================
 
@@ -75,6 +91,121 @@ def _get_docling_converter():
         from docling.document_converter import DocumentConverter
         _DOCLING_CONVERTER = DocumentConverter()
     return _DOCLING_CONVERTER
+
+
+# ============================================================
+# PDF 分页批处理（解决大文件内存溢出）
+# ============================================================
+
+def _pdf_batch_convert_with_docling(source_path: Path, output_path: Path
+                                    ) -> Tuple[str, Optional[str], Optional[str]]:
+    """
+    PDF 分页批处理：
+    - 按 PDF_BATCH_PAGE_SIZE 分批加载页面
+    - 每批单独转换、合并结果、及时释放内存
+    - 避免一次性加载整个大文件导致内存爆掉
+    
+    返回 (status, error, warning)。
+    """
+    import gc
+    try:
+        from pypdf import PdfReader
+        from docling.document_converter import DocumentConverter
+        
+        reader = PdfReader(str(source_path))
+        total_pages = len(reader.pages)
+        
+        if total_pages == 0:
+            return ("empty", "PDF 没有页面内容", None)
+        
+        # 如果文件较小（≤PDF_BATCH_PAGE_SIZE），直接用原方法处理
+        if total_pages <= PDF_BATCH_PAGE_SIZE:
+            return _convert_with_docling_direct(source_path, output_path)
+        
+        # 大文件：分批处理
+        all_md_content = []
+        batch_count = (total_pages + PDF_BATCH_PAGE_SIZE - 1) // PDF_BATCH_PAGE_SIZE
+        
+        for batch_idx in range(batch_count):
+            start_page = batch_idx * PDF_BATCH_PAGE_SIZE
+            end_page = min((batch_idx + 1) * PDF_BATCH_PAGE_SIZE, total_pages)
+            
+            # 创建临时PDF只包含这批页面
+            temp_pdf_path = TEMP_DIR / f"{source_path.stem}_batch_{batch_idx}.pdf"
+            try:
+                from pypdf import PdfWriter
+                writer = PdfWriter()
+                for page_idx in range(start_page, end_page):
+                    writer.add_page(reader.pages[page_idx])
+                
+                with open(temp_pdf_path, 'wb') as f:
+                    writer.write(f)
+                
+                # 用 Docling 转换这批页面
+                converter = _get_docling_converter()
+                result = converter.convert(str(temp_pdf_path))
+                md_batch = result.document.export_to_markdown()
+                
+                if md_batch.strip():
+                    # 添加页码分隔符
+                    all_md_content.append(f"\n\n<!-- PDF Pages {start_page + 1}-{end_page} -->\n{md_batch}")
+                
+                # 及时释放内存
+                del result
+                gc.collect()
+                
+            finally:
+                # 删除临时文件
+                if temp_pdf_path.exists():
+                    try:
+                        temp_pdf_path.unlink()
+                    except OSError:
+                        pass
+        
+        if not all_md_content:
+            return ("empty", "Docling 转换内容为空", None)
+        
+        md_content = "".join(all_md_content).strip()
+        md_content = _clean_md_content(md_content)
+        
+        if not md_content.strip():
+            return ("empty", "内容为空（移除了所有模板段落）", None)
+        
+        _ensure_output_dir(output_path)
+        output_path.write_text(md_content, encoding="utf-8")
+        warning = _check_md_size(output_path)
+        
+        return ("ok", None, warning)
+        
+    except Exception as e:
+        return ("error", f"PDF分页处理失败: {type(e).__name__}: {e}", None)
+
+
+def _convert_with_docling_direct(source_path: Path, output_path: Path
+                                 ) -> Tuple[str, Optional[str], Optional[str]]:
+    """
+    直接转换（不分页）- 用于小文件或其他格式（docx等）。
+    返回 (status, error, warning)。
+    """
+    try:
+        converter = _get_docling_converter()
+        result = converter.convert(str(source_path))
+        md_content = result.document.export_to_markdown()
+    except Exception as e:
+        return ("error", f"Docling: {type(e).__name__}: {e}", None)
+
+    if not md_content.strip():
+        return ("empty", "Docling 转换内容为空", None)
+
+    md_content = _clean_md_content(md_content)
+    if not md_content.strip():
+        return ("empty", "内容为空（移除了所有模板段落）", None)
+
+    _ensure_output_dir(output_path)
+    output_path.write_text(md_content, encoding="utf-8")
+    warning = _check_md_size(output_path)
+
+    return ("ok", None, warning)
 
 
 # ============================================================
@@ -175,38 +306,10 @@ def scan_compatibility(directory: Path) -> list[tuple[Path, str]]:
     return problems
 
 
-def _convert_with_docling(source_path: Path, output_path: Path
-                          ) -> Tuple[str, Optional[str], Optional[str]]:
-    """
-    用 Docling 转换文档（支持 docx/pdf）。
-
-    注：不再在这里单独起子进程隔离 Docling 调用。上层的
-    `convert_single_file_isolated()` 已经把"整个单文件转换"（包括这里的
-    Docling 调用、失败后的原生降级路径等）打包放进一个独立子进程里跑，
-    并配有真正的操作系统级超时+崩溃隔离；如果这里再单独起一层子进程，
-    只会让每个 docx/pdf 文件多付一次 Python 解释器启动 + Docling 模型
-    加载的开销，没有任何额外收益。
-    返回 (status, error, warning)。
-    """
-    try:
-        converter = _get_docling_converter()
-        result = converter.convert(str(source_path))
-        md_content = result.document.export_to_markdown()
-    except Exception as e:
-        return ("error", f"Docling: {type(e).__name__}: {e}", None)
-
-    if not md_content.strip():
-        return ("empty", "Docling 转换内容为空", None)
-
-    md_content = _clean_md_content(md_content)
-    if not md_content.strip():
-        return ("empty", "内容为空（移除了所有模板段落）", None)
-
-    _ensure_output_dir(output_path)
-    output_path.write_text(md_content, encoding="utf-8")
-    warning = _check_md_size(output_path)
-
-    return ("ok", None, warning)
+# 注：_convert_with_docling 已被替换为分页处理版本
+# - PDF 文件使用 _pdf_batch_convert_with_docling（分页批处理）
+# - DOCX 等其他格式使用 _convert_with_docling_direct（直接处理）
+# 详见上面的函数定义
 
 
 # ============================================================
@@ -665,29 +768,69 @@ def _pdf_fallback(source_path: Path, output_path: Path
         return ("error", f"PyPDF {type(e).__name__}: {e}")
 
 
-def _xlsx_fallback(source_path: Path, output_path: Path
-                   ) -> Tuple[str, Optional[str]]:
-    """openpyxl 降级方案（Docling 不可用时）。"""
+def _xlsx_batch_fallback(source_path: Path, output_path: Path
+                        ) -> Tuple[str, Optional[str]]:
+    """
+    openpyxl 分批降级方案（处理大型Excel文件避免内存溢出）。
+    - 按 EXCEL_BATCH_ROW_SIZE 分批加载行数据
+    - 每批处理后及时释放内存
+    - 适用于百万行级别的大表
+    """
+    import gc
     try:
         from openpyxl import load_workbook
+        
         wb = load_workbook(str(source_path), read_only=True, data_only=True)
         md_lines = []
+        
         for sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
             md_lines.append(f"## {sheet_name}")
             md_lines.append("")
-            rows = list(ws.iter_rows(values_only=True))
-            if not rows:
+            
+            # 获取总行数
+            total_rows = ws.max_row
+            if total_rows == 0:
                 continue
-            headers = [str(c) if c is not None else "" for c in rows[0]]
+            
+            # 提取表头
+            header_row = list(ws.iter_rows(min_row=1, max_row=1, values_only=True))[0]
+            headers = [str(c) if c is not None else "" for c in header_row]
             md_lines.append("| " + " | ".join(headers) + " |")
             md_lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
-            data_rows = [row for row in rows[1:] if not _is_junk_xlsx_row(row)]
-            for row in data_rows:
-                cells = [str(c) if c is not None else "" for c in row]
-                md_lines.append("| " + " | ".join(cells) + " |")
+            
+            # 分批处理数据行
+            if total_rows > EXCEL_BATCH_ROW_SIZE:
+                batch_count = (total_rows - 1 + EXCEL_BATCH_ROW_SIZE - 1) // EXCEL_BATCH_ROW_SIZE
+                for batch_idx in range(batch_count):
+                    start_row = 2 + batch_idx * EXCEL_BATCH_ROW_SIZE
+                    end_row = min(2 + (batch_idx + 1) * EXCEL_BATCH_ROW_SIZE - 1, total_rows)
+                    
+                    if start_row > end_row:
+                        break
+                    
+                    # 读取这批行
+                    for row in ws.iter_rows(min_row=start_row, max_row=end_row, values_only=True):
+                        if not _is_junk_xlsx_row(row):
+                            cells = [str(c) if c is not None else "" for c in row]
+                            md_lines.append("| " + " | ".join(cells) + " |")
+                    
+                    # 定期释放内存
+                    if batch_idx % 5 == 0:
+                        gc.collect()
+            else:
+                # 小表直接处理
+                data_rows = list(ws.iter_rows(min_row=2, max_row=total_rows, values_only=True))
+                for row in data_rows:
+                    if not _is_junk_xlsx_row(row):
+                        cells = [str(c) if c is not None else "" for c in row]
+                        md_lines.append("| " + " | ".join(cells) + " |")
+            
             md_lines.append("")
+        
         wb.close()
+        gc.collect()
+        
         md_content = "\n".join(md_lines).strip()
         if not md_content:
             return ("empty", "Excel 内容为空")
@@ -700,7 +843,16 @@ def _xlsx_fallback(source_path: Path, output_path: Path
     except ImportError:
         return ("error", "缺少 openpyxl 库")
     except Exception as e:
-        return ("error", f"{type(e).__name__}: {e}")
+        return ("error", f"Excel分批处理失败: {type(e).__name__}: {e}")
+
+
+def _xlsx_fallback(source_path: Path, output_path: Path
+                   ) -> Tuple[str, Optional[str]]:
+    """
+    openpyxl 降级方案（Docling 不可用时）。
+    自动使用分批处理来处理大型文件。
+    """
+    return _xlsx_batch_fallback(source_path, output_path)
 
 
 def _pptx_fallback(source_path: Path, output_path: Path
@@ -919,8 +1071,11 @@ def convert_single_file(source_path: Path) -> dict:
 
         # ── 策略：Docling 主力(docx/pdf) → 原生降级(xlsx/pptx) → 直接复制(md/txt) ──
         if ext in _DOCLING_SUPPORTED:
-            # 主力：Docling
-            status, error, warning = _convert_with_docling(source_path, output_path)
+            # 主力：Docling（PDF使用分页批处理避免内存溢出）
+            if ext == ".pdf":
+                status, error, warning = _pdf_batch_convert_with_docling(source_path, output_path)
+            else:
+                status, error, warning = _convert_with_docling_direct(source_path, output_path)
             if status == "ok":
                 result["status"] = status
                 result["error"] = error

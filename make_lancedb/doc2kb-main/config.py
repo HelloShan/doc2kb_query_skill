@@ -18,6 +18,7 @@ import warnings
 import logging
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -59,6 +60,30 @@ def _env_float(name: str, default: float) -> float:
 # 环境变量里已经设置了 HF_ENDPOINT（比如海外服务器想用官方源），不会被
 # 这里强制覆盖掉。
 os.environ.setdefault("HF_ENDPOINT", os.getenv("DOC2KB_HF_ENDPOINT", "https://hf-mirror.com"))
+
+# ============================================================
+# 缓存目录配置（模型缓存目录）
+# ============================================================
+# 构建侧和查询侧应该共享同一个模型缓存目录，这样模型只需下载一次。
+# 如果未配置，则使用系统默认位置（~/.cache/huggingface/ 等）。
+
+_raw_cache_dir = os.getenv("DOC2KB_CACHE_DIR", "").strip()
+
+if _raw_cache_dir:
+    # 相对路径相对于本文件（config.py）所在目录
+    CACHE_DIR = Path(_raw_cache_dir)
+    if not CACHE_DIR.is_absolute():
+        CACHE_DIR = Path(__file__).resolve().parent / CACHE_DIR
+    
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # 设置两个库的缓存位置
+    # - FASTEMBED_CACHE_PATH: fastembed 库用（embedding 模型）
+    # - HF_HOME: huggingface_hub 库用（所有 HF 相关的下载和缓存）
+    os.environ["FASTEMBED_CACHE_PATH"] = str(CACHE_DIR.resolve())
+    os.environ["HF_HOME"] = str(CACHE_DIR.resolve())
+else:
+    CACHE_DIR = None
 
 # 一旦本地已经有 Docling/HuggingFace 模型缓存，可以打开这个开关跳过所有
 # 联网检查。docx/pdf 每次起 Docling 转换时，huggingface_hub 都会尝试连一次
