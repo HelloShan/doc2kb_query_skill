@@ -721,6 +721,7 @@ def run_stats(args, log: Logger):
         log.info(f"  路径:      {db_stats['path']}")
         log.info(f"  表名:      {db_stats['table']}")
         log.info(f"  向量维度:  {db_stats['vector_dim']}")
+        log.info(f"  文件数量:  {db_stats['file_count'] if db_stats.get('file_count') is not None else '未知'}")
         log.info(f"  分块总数:  {db_stats['total_chunks']}")
         log.info(f"  嵌入模型:  {db_stats['model']}")
     except Exception as e:

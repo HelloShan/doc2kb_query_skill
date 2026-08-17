@@ -716,10 +716,25 @@ def get_db_stats() -> dict:
     try:
         table = _open_or_create_db()
         count = table.count_rows()
+
+        # 文件数：对 rel_path 列去重计数。只拉这一列（不拉 768 维向量），
+        # 避免为了数个文件数就把整张表的向量都读出来。
+        try:
+            rel_paths = (
+                table.to_lance()
+                .to_table(columns=["rel_path"])
+                .column("rel_path")
+                .to_pylist()
+            )
+            file_count = len(set(rel_paths))
+        except Exception:
+            file_count = None
+
         return {
             "path": str(DB_PATH),
             "table": TABLE_NAME,
             "total_chunks": count,
+            "file_count": file_count,
             "vector_dim": VECTOR_DIM,
             "model": EMBEDDING_MODEL,
         }

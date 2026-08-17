@@ -23,7 +23,11 @@ pypdf>=5.0             # .pdf → MD 轻量转换（纯Python）
 openpyxl>=3.1          # .xlsx → MD 转换（Excel → Markdown表格）
 xlrd>=2.0              # .xls  → MD 转换（旧版Excel）
 olefile>=0.47          # .doc  → MD 回退提取（纯Python，无格式）
-#pywin32>=306           # .doc → .docx 转换（Windows 调用 Office/WPS COM）
+pywin32>=306            # 老版 .doc/.xls 误标为 .docx/.xlsx 时，自动调用 WPS/Office
+                        # COM 另存为新格式（convert.py: _convert_legacy_office_file）
+                        # 仅 Windows 有效；非 Windows 平台装不上/用不到，
+                        # 装不上也不影响其它转换路径，遇到这类文件会照常
+                        # 跳过并提示手工处理，不会导致流水线报错中断
 
 # ============================================================
 # 【可选层】按需安装
