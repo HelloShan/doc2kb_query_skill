@@ -284,11 +284,28 @@ def run_build(args, log: Logger):
                 state.init_file(rel, sha256, stat.st_size, mtime, str(fp.resolve()))
 
                 # 关键优化：如果转换已完成但入库未完成，直接进 ingest 队列，不重复转换
+                #
+                # 注意：--ingest-only 模式下不能在这里 append 到 files_to_ingest！
+                # 因为下方专门的 `if ingest_only:` 代码块（扫描 all_files，收集所有
+                # "已转换但未入库"的文件）会把同一批文件再收集一遍——needs_rebuild()
+                # 只要 ingestion.status 是 "pending"（即"转换成功、正常等待入库"这个
+                # 完全正常的中间状态）就会返回 True，导致这里和下面那段重复代码块
+                # 对同一个文件各加入一次，files_to_ingest 里出现两份相同条目。
+                # 结果就是待入库文件数"翻倍"，且同一文件被两个线程并发处理，
+                # 产生写入竞争 / 双倍内存与模型推理负载，容易在处理量较大时
+                # 直接把进程冲垮（无 Python 异常、终端静默退出）。
+                # 这里只在非 ingest_only 的正常 build 场景下才需要这个"跳过重复
+                # 转换、直接排入入库队列"的优化；ingest_only 场景交给下方专用逻辑
+                # 统一处理即可。
                 if state.is_convert_done(rel):
-                    if not convert_only:
+                    if not convert_only and not ingest_only:
                         md_path = OUTPUT_MD_DIR / Path(rel).with_suffix(".md")
                         if md_path.exists():
                             files_to_ingest.append((md_path, rel, sha256))
+                        stats.add_convert_file_info("retry_ingest")
+                    elif ingest_only:
+                        # 不在此处入队，交给下方 `if ingest_only:` 专用逻辑统一收集，
+                        # 避免重复。这里只做统计展示用途。
                         stats.add_convert_file_info("retry_ingest")
                     else:
                         stats.add_convert_file_info("skip")
@@ -347,6 +364,26 @@ def run_build(args, log: Logger):
                     files_to_ingest.append((md_path, rel, state.get_file_sha256(rel)))
             log.info(f"  待入库（全量）: {len(files_to_ingest)} 个 MD 文件")
         # 增量入库在转换完成后自动添加
+
+    # ── 防御性去重：无论上面走了哪条逻辑分支，同一个 rel_path 只允许
+    #    进入 files_to_ingest 一次。这不只是修个 bug，更是防止未来任何
+    #    代码改动又意外引入重复入队——重复入队会导致同一文件被多个
+    #    线程并发处理（写竞争产生脏数据），且让入库阶段的实际工作量
+    #    凭空翻倍，在资源紧张的机器上是诱发进程崩溃/静默退出的高危因素。
+    if files_to_ingest:
+        _seen_ingest_rel: set = set()
+        _deduped_ingest = []
+        _dup_count = 0
+        for item in files_to_ingest:
+            _rel = item[1]
+            if _rel in _seen_ingest_rel:
+                _dup_count += 1
+                continue
+            _seen_ingest_rel.add(_rel)
+            _deduped_ingest.append(item)
+        if _dup_count:
+            log.warn(f"  检测到 {_dup_count} 个重复入队的文件，已自动去重")
+        files_to_ingest = _deduped_ingest
 
     # ── 扫描完成，立即持久化初始状态（防止中途杀进程丢进度）──
     state.save()

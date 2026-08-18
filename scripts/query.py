@@ -19,6 +19,12 @@ doc2kb 知识库查询 —— 自包含 Skill 脚本
   # 批量查询
   python query.py --batch '[{"id":"1","question":"问题A"},{"id":"2","question":"问题B"}]'
 
+  # HTTP 接口（server 自动常驻，无需手动管理）
+  curl http://127.0.0.1:8788/health
+  curl -X POST http://127.0.0.1:8788/ \
+     -H "Authorization: Bearer <口令>" \
+     -d '{"action":"search","question":"你的问题","top_k":5}'
+
   # 手动启动常驻服务
   python query.py --server
 """

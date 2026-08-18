@@ -9,9 +9,9 @@ __pycache__
 .env
 
 # 运行时产生的文件
-make_lancedb/output_md/
-make_lancedb/source_docs/
-make_lancedb/*.lancedb/
-make_lancedb/model_cache/
-make_lancedb/pipeline_state.json
-make_lancedb/doc2kb-main/.env
+doc2kb/output_md/
+doc2kb/source_docs/
+doc2kb/*.lancedb/
+doc2kb/model_cache/
+doc2kb/pipeline_state.json
+doc2kb/doc2kb-main/.env
