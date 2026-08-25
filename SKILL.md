@@ -1,7 +1,7 @@
 ---
 name: doc2kb_query
 description: >
-  查询 make_lancedb 构建的本地技术知识库，回答与已入库文档相关的技术问题。
+  查询 doc2kb 构建的本地技术知识库，回答与已入库文档相关的技术问题。
   适用于：查找公司/项目技术规范、操作手册、配置参数说明、SQL 建表字段含义等。
   不适用于：通用知识问答、网络搜索、代码调试等不在知识库覆盖范围内的任务。
 version: "1.0"
@@ -25,7 +25,7 @@ skills:
 ### 1. 配置
 
 ```bash
-cd doc2kb_query/scripts
+cd <skill_dir>/scripts   # 例: ~/.hermes/profiles/kb-agent-telgram01/skills/doc2kb_query/scripts
 cp .env.example .env
 # 编辑 .env，把 DOC2KB_QUERY_DB_PATH 改成知识库的绝对路径，避免执行脚本当前路径变动时出错
 # 以及把 DOC2KB_QUERY_EMBEDDING_MODEL 改成构建时用的模型
@@ -33,23 +33,25 @@ cp .env.example .env
 
 ### 2. 安装依赖
 
+> 如果系统 python3 是 PEP 668 环境（无 pip 模块），**必须用 uv/venv**，不要 `python3 -m pip install`。
+
 ```bash
-pip install fastembed lancedb tantivy pyarrow python-dotenv
-# 如果用了术语表功能，还需要:
-pip install PyYAML
+cd <skill_dir>
+uv venv .venv
+uv pip install --python .venv/bin/python fastembed lancedb tantivy pyarrow python-dotenv PyYAML
 ```
 
 ### 3. 查询
 
 ```bash
 # 单题查询（首次会自动在后台拉起常驻 server，模型只加载一次）
-python scripts/query.py --question "你的问题"
+.venv/bin/python scripts/query.py --question "你的问题"
 
 # 对话友好格式
-python scripts/query.py --question "你的问题" --format context
+.venv/bin/python scripts/query.py --question "你的问题" --format context
 
 # 批量查询
-python scripts/query.py --batch '[{"id":"1","question":"问题A"},{"id":"2","question":"问题B"}]'
+.venv/bin/python scripts/query.py --batch '[{"id":"1","question":"问题A"},{"id":"2","question":"问题B"}]'
 
 # HTTP 接口（server 自动常驻，无需手动管理）
 curl http://127.0.0.1:8788/health
@@ -125,7 +127,7 @@ taskkill /PID <scripts/.server_<端口>.pid 里的值> /F
 | `matched_by` | `hybrid`=向量+BM25 双路，`keyword`=仅 BM25 精确命中（型号/缩写等）|
 | `doc_type` | `doc`/`sql`/`yaml`/`json`/`ini` |
 
-## Claude 回答规范
+## 回答规范
 
 **有结果时：**
 - 引用原文，标注来源：`📄 [文件名]`
@@ -142,9 +144,9 @@ taskkill /PID <scripts/.server_<端口>.pid 里的值> /F
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `DOC2KB_QUERY_DB_PATH` | `../doc2kb.lancedb` | 知识库路径，**建议绝对路径** |
+| `DOC2KB_QUERY_DB_PATH` | `../make_lancedb/doc2kb.lancedb` | 知识库路径，**建议绝对路径** |
 | `DOC2KB_QUERY_EMBEDDING_MODEL` | `BAAI/bge-small-zh-v1.5` | **必须和构建时一致** |
-| `DOC2KB_QUERY_EMBEDDING_MAX_TOKENS` | `512` | 随模型同步修改 |
+| `DOC2KB_QUERY_EMBEDDING_MAX_TOKENS` | `512` | 随模型同步修改：bge-small-zh-v1.5=512，jina-embeddings-v2-base-zh=8192 |
 | `DOC2KB_QUERY_TABLE_NAME` | `docs` | LanceDB 表名 |
 | `DOC2KB_QUERY_TOP_K` | `5` | 返回结果数 |
 | `DOC2KB_QUERY_SIMILARITY_THRESHOLD` | `0.5` | 余弦相似度过滤阈值 |
@@ -154,7 +156,7 @@ taskkill /PID <scripts/.server_<端口>.pid 里的值> /F
 | `DOC2KB_QUERY_SERVER_START_TIMEOUT` | `60` | 等待常驻 server 就绪的超时（秒），首次运行需下载模型时可调大 |
 | `DOC2KB_QUERY_IDLE_TIMEOUT` | `3600` | 空闲自动退出（秒）|
 | `DOC2KB_QUERY_AUTH_TOKEN` | （空）| 访问口令，空=不鉴权 |
-| `DOC2KB_QUERY_GLOSSARY_PATH` | `../glossary.yaml` | 术语表，不存在时跳过 |
+| `DOC2KB_QUERY_GLOSSARY_PATH` | `../make_lancedb/glossary.yaml` | 术语表，不存在时跳过 |
 
 > `DOC2KB_QUERY_DB_PATH` / `DOC2KB_QUERY_GLOSSARY_PATH` 配成相对路径时，
 > 会按"相对这个脚本所在目录"解析，不依赖你从哪个目录运行命令，可以放心
@@ -168,3 +170,4 @@ taskkill /PID <scripts/.server_<端口>.pid 里的值> /F
 | `维度不匹配` | 查询和构建模型不一致 | 检查 `EMBEDDING_MODEL` 两边是否一致 |
 | `Model XXX is not supported` | fastembed 不支持此模型 | 改用 `bge-small-zh-v1.5` 或 `jina-embeddings-v2-base-zh` |
 | 查询无结果但库有内容 | 阈值过高或问法偏差大 | 降低 `SIMILARITY_THRESHOLD`；或配置术语表 |
+| 常驻 server 反复掉线（每次拉起后验证通过，过一会 8788 又无监听） | `query.py` 启动子进程未脱离会话（`subprocess.Popen` 缺 `start_new_session=True`），父终端会话结束即连带杀掉 server | 已修复：`scripts/query.py` 中 Popen 已加 `start_new_session=True`。若旧副本仍掉线，检查该行；修复后跨 terminal 调用验证 `curl http://127.0.0.1:8788/health` |

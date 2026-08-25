@@ -54,7 +54,8 @@ import os
 import signal
 from pathlib import Path
 from datetime import datetime
-from typing import List, Tuple
+from typing import List, Tuple, Set
+import lancedb
 
 # 确保 Ctrl+C 能中断 Python 代码（解决 ThreadPoolExecutor 不响应的问题）
 signal.signal(signal.SIGINT, signal.SIG_DFL)
@@ -65,7 +66,7 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 from config import (
-    SOURCE_DIR, OUTPUT_MD_DIR, DB_PATH, STATE_FILE, LOG_FILE,
+    SOURCE_DIR, OUTPUT_MD_DIR, DB_PATH, TABLE_NAME, STATE_FILE, LOG_FILE,
     SUPPORTED_EXTENSIONS, CONVERT_WORKERS, COLOR_OUTPUT,
     validate_config,
 )
@@ -877,6 +878,46 @@ def run_delete(args, log: Logger):
             state.save()
             log.ok(f"已同步清理 pipeline_state 中的 {removed} 条记录")
 
+def get_stored_filenames(db_path, table_name):
+    """从 LanceDB 中读取 'source' 字段并去重"""
+    if not os.path.exists(db_path):
+        print(f"[-] 错误: 数据库路径 '{db_path}' 不存在。", file=sys.stderr)
+        return []
+    
+    try:
+        db = lancedb.connect(db_path)
+        if table_name not in db.table_names():
+            print(
+                f"[-] 错误: 表 '{table_name}' 不存在。当前表: {db.table_names()}",
+                file=sys.stderr,
+            )
+            return []
+        
+        tbl = db.open_table(table_name)
+        
+        # 仅读取 source 列，去重并排序
+        arrow_table = tbl.search().select(["source"]).to_arrow()
+        file_list = arrow_table["source"].to_pylist()
+        
+        return sorted(list(set(filter(None, file_list))))
+    
+    except Exception as e:
+        print(f"[-] 查询失败: {e}", file=sys.stderr)
+        return []
+    
+
+def list_files_command(args):
+    """命令行调用的处理函数。"""
+    filenames = get_stored_filenames(DB_PATH, TABLE_NAME)
+    if not filenames:
+      print("[!] 库表中没有已入库的文件。")
+      return
+
+    print(f"\n[+] 全库共计入库文件 {len(filenames)} 个：")
+    print("=" * 60)
+    for idx, name in enumerate(filenames, start=1):
+      print(f"  {idx:3d}. {name}")
+    print("=" * 60)
 
 # ============================================================
 # CLI 入口
@@ -938,6 +979,9 @@ def main():
                           help="跳过确认提示")
     delete_p.add_argument("--state", action="store_true",
                           help="同步清理 pipeline_state.json 中的记录")
+                          
+    # 注册 list-files 参数/命令
+    subparsers.add_parser("list-files", help="查看 doc2kb.lancedb 库表里面已入库的文件名")
 
     args = parser.parse_args()
 
@@ -960,6 +1004,8 @@ def main():
             run_stats(args, log)
         elif args.command == "delete":
             run_delete(args, log)
+        elif args.command == "list-files":
+            list_files_command(args)
         else:
             parser.print_help()
     except KeyboardInterrupt:
